@@ -117,10 +117,19 @@ export const Sandbox2D: React.FC<Sandbox2DProps> = ({
   const destKey = destinationBodyName.toLowerCase();
   const origBody = CELESTIAL_BODIES[origKey] || CELESTIAL_BODIES["earth"];
   const destBody = CELESTIAL_BODIES[destKey] || CELESTIAL_BODIES["mars"];
-  const isHeliocentric = (origBody.parent === "Sun" && destBody.parent === "Sun") || origKey === "sun";
+  
+  // Authoritative Frame Determination
+  const hasSunBody = bodyHistories.some((b) => b.id.toLowerCase() === "sun" || b.name.toLowerCase() === "sun");
+  const isHeliocentric = (
+    hasSunBody ||
+    (multiSimResult && multiSimResult.central_body?.toLowerCase() === "sun") ||
+    (origBody.parent === "Sun" && destBody.parent === "Sun") ||
+    origKey === "sun"
+  );
+  const centralBodyKey = isHeliocentric ? "sun" : (multiSimResult ? multiSimResult.central_body : originBodyName).toLowerCase();
 
   const getAuthoritativeBodyState = useCallback((bodyKey: string) => {
-    const body = bodyHistories.find((b) => b.id === bodyKey.toLowerCase() || b.name.toLowerCase() === bodyKey.toLowerCase());
+    const body = bodyHistories.find((b) => b.id.toLowerCase() === bodyKey.toLowerCase() || b.name.toLowerCase() === bodyKey.toLowerCase());
     if (!body || body.state_history.length === 0) return null;
     let best = body.state_history[0];
     let bestDt = Math.abs(best.time_seconds - simTimeSec);
@@ -149,7 +158,7 @@ export const Sandbox2D: React.FC<Sandbox2DProps> = ({
     setViewContext("SYSTEM");
   }, []);
 
-  // 2. Fit Mission View (Tight bounds around active spacecraft trajectories)
+  // 2. Fit Mission View (Bounds around Sun, Earth, Mars, and active trajectories)
   const fitMission = useCallback(() => {
     const canvas = canvasRef.current;
     if (!canvas) return;
@@ -159,21 +168,32 @@ export const Sandbox2D: React.FC<Sandbox2DProps> = ({
 
     let minX = Infinity, maxX = -Infinity, minY = Infinity, maxY = -Infinity;
 
+    const includePoint = (x: number, y: number) => {
+      if (x < minX) minX = x;
+      if (x > maxX) maxX = x;
+      if (y < minY) minY = y;
+      if (y > maxY) maxY = y;
+    };
+
+    if (isHeliocentric) {
+      includePoint(0, 0); // Include Sun at origin
+    }
+
+    bodyHistories.forEach((b) => {
+      b.state_history.forEach((st) => {
+        includePoint(st.position[0], st.position[1]);
+      });
+    });
+
     if (multiSimResult && multiSimResult.objects.length > 0) {
       multiSimResult.objects.forEach((obj) => {
         obj.state_history.forEach((pt) => {
-          if (pt.position[0] < minX) minX = pt.position[0];
-          if (pt.position[0] > maxX) maxX = pt.position[0];
-          if (pt.position[1] < minY) minY = pt.position[1];
-          if (pt.position[1] > maxY) maxY = pt.position[1];
+          includePoint(pt.position[0], pt.position[1]);
         });
       });
     } else if (stateHistory && stateHistory.length > 0) {
       stateHistory.forEach((pt) => {
-        if (pt.position[0] < minX) minX = pt.position[0];
-        if (pt.position[0] > maxX) maxX = pt.position[0];
-        if (pt.position[1] < minY) minY = pt.position[1];
-        if (pt.position[1] > maxY) maxY = pt.position[1];
+        includePoint(pt.position[0], pt.position[1]);
       });
     }
 
@@ -192,7 +212,7 @@ export const Sandbox2D: React.FC<Sandbox2DProps> = ({
       zoom: Math.max(1e-16, Math.min(1e2, newZoom)),
     });
     setViewContext("MISSION");
-  }, [multiSimResult, stateHistory]);
+  }, [multiSimResult, stateHistory, bodyHistories, isHeliocentric]);
 
   // 3. Fit Local / Selected Object View
   const fitObject = useCallback((objId?: string | null) => {
@@ -231,7 +251,7 @@ export const Sandbox2D: React.FC<Sandbox2DProps> = ({
   // Auto-fit on initial render or simulation change
   useEffect(() => {
     fitMission();
-  }, [multiSimResult, fitMission]);
+  }, [multiSimResult, stateHistory, fitMission]);
 
   // Mouse pan & zoom handlers
   const handleMouseDown = (e: React.MouseEvent<HTMLCanvasElement>) => {
@@ -263,7 +283,6 @@ export const Sandbox2D: React.FC<Sandbox2DProps> = ({
     const rect = canvas.getBoundingClientRect();
     const clickX = e.clientX - rect.left;
     const clickY = e.clientY - rect.top;
-    const worldPt = screenToWorld(clickX, clickY, rect.width, rect.height);
 
     // Check collision / conjunction click or spacecraft selection
     if (multiSimResult && multiSimResult.objects.length > 0) {
@@ -355,7 +374,7 @@ export const Sandbox2D: React.FC<Sandbox2DProps> = ({
       // 2. Draw backend-provided planetary histories and current bodies.
       bodyHistories.forEach((history) => {
         if (history.id === "sun" || history.state_history.length === 0) return;
-        ctx.strokeStyle = "rgba(120, 120, 120, 0.35)";
+        ctx.strokeStyle = history.id === "earth" ? "rgba(50, 150, 255, 0.35)" : (history.id === "mars" ? "rgba(255, 100, 50, 0.35)" : "rgba(140, 140, 140, 0.35)");
         ctx.setLineDash([2, 4]);
         ctx.lineWidth = 0.8;
         ctx.beginPath();
@@ -367,7 +386,7 @@ export const Sandbox2D: React.FC<Sandbox2DProps> = ({
         ctx.setLineDash([]);
         const current = getAuthoritativeBodyState(history.id)?.state || history.state_history[0];
         const ps = worldToScreen(current.position[0], current.position[1], width, height);
-        const pr = scaleMode === "DISPLAY" ? (history.id === "jupiter" ? 7 : 5) : Math.max(3, history.radius_m * camera.zoom);
+        const pr = scaleMode === "DISPLAY" ? (history.id === "jupiter" ? 7 : (history.id === "earth" ? 6 : 5)) : Math.max(3, history.radius_m * camera.zoom);
         ctx.save();
         ctx.translate(ps.x, ps.y);
         drawPixelPlanet(ctx, history.name, pr, history.name, true);
@@ -392,24 +411,21 @@ export const Sandbox2D: React.FC<Sandbox2DProps> = ({
     // CONTEXT B & C: MISSION & OBJECT VIEW
     // -------------------------------------------------------------
     else {
-      // 1. Draw Primary Central Body
-      const centralBodyKey = (multiSimResult ? multiSimResult.central_body : originBodyName).toLowerCase();
-      const centralBody = CELESTIAL_BODIES[centralBodyKey] || CELESTIAL_BODIES["earth"];
-      
-      const bodyScreen = worldToScreen(0, 0, width, height);
-      ctx.save();
-      ctx.translate(bodyScreen.x, bodyScreen.y);
-      const bRad = scaleMode === "DISPLAY" ? 18 : Math.max(4, centralBody.radius_km * 1000.0 * camera.zoom);
-      drawPixelPlanet(ctx, centralBody.name, bRad, centralBody.name);
-      ctx.restore();
+      if (isHeliocentric) {
+        // 1. Draw Sun at (0, 0)
+        const sunScreen = worldToScreen(0, 0, width, height);
+        const sunRad = scaleMode === "DISPLAY" ? 14 : Math.max(4, 696340000 * camera.zoom);
+        ctx.save();
+        ctx.translate(sunScreen.x, sunScreen.y);
+        drawPixelPlanet(ctx, "Sun", sunRad, "Sun");
+        ctx.restore();
 
-      // If Sun is central body, draw backend-provided planetary histories and current bodies.
-      if (centralBodyKey === "sun") {
+        // 2. Draw backend-provided planetary histories (Earth, Mars, etc.)
         bodyHistories.forEach((history) => {
           if (history.id === "sun" || history.state_history.length === 0) return;
-          ctx.strokeStyle = "rgba(140, 140, 140, 0.35)";
-          ctx.setLineDash([2, 4]);
-          ctx.lineWidth = 0.9;
+          ctx.strokeStyle = history.id === "earth" ? "rgba(50, 160, 255, 0.4)" : (history.id === "mars" ? "rgba(255, 100, 50, 0.4)" : "rgba(140, 140, 140, 0.35)");
+          ctx.setLineDash([3, 4]);
+          ctx.lineWidth = 1.1;
           ctx.beginPath();
           history.state_history.forEach((sample, idx) => {
             const pt = worldToScreen(sample.position[0], sample.position[1], width, height);
@@ -417,22 +433,32 @@ export const Sandbox2D: React.FC<Sandbox2DProps> = ({
           });
           ctx.stroke();
           ctx.setLineDash([]);
+
+          // Draw planet at current simTimeSec
           const current = getAuthoritativeBodyState(history.id)?.state || history.state_history[0];
           const ps = worldToScreen(current.position[0], current.position[1], width, height);
-          const pr = scaleMode === "DISPLAY" ? (history.id === "jupiter" ? 7 : 5) : Math.max(3, history.radius_m * camera.zoom);
+          const pr = scaleMode === "DISPLAY" ? (history.id === "jupiter" ? 8 : (history.id === "earth" ? 7 : 6)) : Math.max(3, history.radius_m * camera.zoom);
           ctx.save();
           ctx.translate(ps.x, ps.y);
           drawPixelPlanet(ctx, history.name, pr, history.name, true);
           ctx.restore();
         });
+      } else {
+        // Draw Primary Central Body at (0, 0) (e.g. Earth for geocentric)
+        const centralBody = CELESTIAL_BODIES[centralBodyKey] || CELESTIAL_BODIES["earth"];
+        const bodyScreen = worldToScreen(0, 0, width, height);
+        ctx.save();
+        ctx.translate(bodyScreen.x, bodyScreen.y);
+        const bRad = scaleMode === "DISPLAY" ? 18 : Math.max(4, centralBody.radius_km * 1000.0 * camera.zoom);
+        drawPixelPlanet(ctx, centralBody.name, bRad, centralBody.name);
+        ctx.restore();
       }
 
-      // 2. Draw Multi-Spacecraft Trajectories & Sprites
-
+      // 3. Draw Trajectories & Spacecraft Sprites
       const allObjects: SpacecraftTrack[] = multiSimResult ? multiSimResult.objects : [];
 
       if (allObjects.length > 0) {
-        // Draw Trajectory Trails
+        // Multi-Spacecraft Fleet Trajectories
         allObjects.forEach((obj) => {
           if (obj.state_history.length < 2) return;
 
@@ -462,10 +488,9 @@ export const Sandbox2D: React.FC<Sandbox2DProps> = ({
           ctx.setLineDash([]);
         });
 
-        // 3. Draw Conjunction Encounter Link Lines
+        // Conjunction Encounter Link Lines
         if (multiSimResult && multiSimResult.conjunctions.length > 0) {
           multiSimResult.conjunctions.forEach((conj) => {
-            // Draw link line if close in time to TCA (|t - TCA| < 120s)
             const dtTCA = Math.abs(simTimeSec - conj.tca_s);
             if (dtTCA < 180.0) {
               const scA = allObjects.find((o) => o.id === conj.spacecraft_a_id);
@@ -481,7 +506,6 @@ export const Sandbox2D: React.FC<Sandbox2DProps> = ({
                   const sA = worldToScreen(stA.position[0], stA.position[1], width, height);
                   const sB = worldToScreen(stB.position[0], stB.position[1], width, height);
 
-                  // Dashed conjunction connection
                   ctx.strokeStyle = conj.risk_level === "CRITICAL" ? "#ff3333" : (conj.risk_level === "HIGH" ? "#ff9900" : "rgba(230, 223, 213, 0.7)");
                   ctx.lineWidth = 1.0;
                   ctx.setLineDash([3, 3]);
@@ -491,12 +515,10 @@ export const Sandbox2D: React.FC<Sandbox2DProps> = ({
                   ctx.stroke();
                   ctx.setLineDash([]);
 
-                  // Midpoint Callout Tag
                   const midX = (sA.x + sB.x) / 2;
                   const midY = (sA.y + sB.y) / 2;
                   ctx.fillStyle = "rgba(0, 0, 0, 0.75)";
                   ctx.fillRect(midX - 32, midY - 14, 64, 13);
-                  ctx.strokeStyle = ctx.strokeStyle;
                   ctx.strokeRect(midX - 32, midY - 14, 64, 13);
 
                   ctx.font = "8px 'JetBrains Mono', monospace";
@@ -509,20 +531,12 @@ export const Sandbox2D: React.FC<Sandbox2DProps> = ({
           });
         }
 
-        // 4. Draw Spacecraft & Debris Sprites at Current Frame
+        // Draw Spacecraft & Debris Sprites
         allObjects.forEach((obj) => {
           const idx = Math.min(currentFrameIdx, obj.state_history.length - 1);
           const st = obj.state_history[idx];
-          if (!st) return;
-
-          // If destroyed before this timestamp, don't draw active sprite
-          if (st.destroyed) {
-            return;
-          }
-
-          if (obj.is_debris && !st.active) {
-            return; // Pre-collision debris inactive
-          }
+          if (!st || st.destroyed) return;
+          if (obj.is_debris && !st.active) return;
 
           const s = worldToScreen(st.position[0], st.position[1], width, height);
           const isSelected = selectedObjectId === obj.id;
@@ -531,18 +545,13 @@ export const Sandbox2D: React.FC<Sandbox2DProps> = ({
           ctx.translate(s.x, s.y);
 
           if (obj.is_debris) {
-            // Draw Debris Fragment with physical rotation
             const rot = (simTimeSec * 0.8 + parseInt(obj.id.slice(-1) || "1")) % (Math.PI * 2);
             drawPixelDebris(ctx, obj.debris_type || "solar_panel", rot);
-
-            // Debris label
             ctx.font = "8px 'JetBrains Mono', monospace";
             ctx.fillStyle = isSelected ? "#ffcc00" : "#a0988e";
             ctx.textAlign = "center";
             ctx.fillText(obj.name.toUpperCase(), 0, 14);
-
           } else {
-            // Draw Spacecraft Sprite
             drawPixelSpacecraft(
               ctx,
               obj.sprite_id || "falcon9",
@@ -551,7 +560,6 @@ export const Sandbox2D: React.FC<Sandbox2DProps> = ({
               isThrustActive && isSelected
             );
 
-            // Selection Reticle
             if (isSelected) {
               ctx.strokeStyle = "#ffcc00";
               ctx.lineWidth = 1;
@@ -560,13 +568,11 @@ export const Sandbox2D: React.FC<Sandbox2DProps> = ({
               ctx.setLineDash([]);
             }
 
-            // Spacecraft Name & Telemetry Label
             ctx.font = "8.5px 'JetBrains Mono', monospace";
             ctx.fillStyle = isSelected ? "#ffcc00" : (obj.color || "#ffffff");
             ctx.textAlign = "center";
             ctx.fillText(obj.name.toUpperCase(), 0, 16);
 
-            // Alt / Speed subtext
             ctx.font = "7.5px 'JetBrains Mono', monospace";
             ctx.fillStyle = "rgba(200, 200, 200, 0.75)";
             ctx.fillText(`${(st.altitude / 1e3).toFixed(1)}km | ${(st.speed / 1e3).toFixed(2)}km/s`, 0, 25);
@@ -575,11 +581,10 @@ export const Sandbox2D: React.FC<Sandbox2DProps> = ({
           ctx.restore();
         });
 
-        // 5. Draw Physical Collision Explosions
+        // Draw Collision Explosions
         if (multiSimResult && multiSimResult.collisions.length > 0) {
           multiSimResult.collisions.forEach((coll) => {
             const dtColl = simTimeSec - coll.time_s;
-            // Active explosion animation for 60 seconds after impact
             if (dtColl >= 0 && dtColl <= 60.0) {
               const progress = dtColl / 60.0;
               const cs = worldToScreen(coll.collision_position_m[0], coll.collision_position_m[1], width, height);
@@ -597,9 +602,9 @@ export const Sandbox2D: React.FC<Sandbox2DProps> = ({
           });
         }
       } else if (stateHistory && stateHistory.length > 1) {
-        // Fallback Single-Trajectory Rendering
-        ctx.strokeStyle = "#ff9900";
-        ctx.lineWidth = 2.0;
+        // Single-Trajectory Rendering (Authoritative Backend Trajectory)
+        ctx.strokeStyle = "#ffcc00";
+        ctx.lineWidth = 2.2;
         ctx.beginPath();
         stateHistory.forEach((pt, idx) => {
           const s = worldToScreen(pt.position[0], pt.position[1], width, height);
@@ -614,6 +619,14 @@ export const Sandbox2D: React.FC<Sandbox2DProps> = ({
           ctx.save();
           ctx.translate(s.x, s.y);
           drawPixelSpacecraft(ctx, spacecraftPresetId, curSt.velocity[0], curSt.velocity[1], isThrustActive);
+
+          ctx.font = "9px 'JetBrains Mono', monospace";
+          ctx.fillStyle = "#ffcc00";
+          ctx.textAlign = "center";
+          ctx.fillText("SPACECRAFT (SC-01)", 0, 18);
+          ctx.font = "8px 'JetBrains Mono', monospace";
+          ctx.fillStyle = "rgba(220, 220, 220, 0.85)";
+          ctx.fillText(`${(curSt.speed / 1e3).toFixed(2)} km/s`, 0, 28);
           ctx.restore();
         }
       }
@@ -633,8 +646,23 @@ export const Sandbox2D: React.FC<Sandbox2DProps> = ({
     originBodyName,
     spacecraftPresetId,
     isThrustActive,
+    isHeliocentric,
+    centralBodyKey,
     worldToScreen,
   ]);
+
+  // Phase 15: Compute Diagnostic HUD telemetry
+  const curSCState = stateHistory[Math.min(currentFrameIdx, stateHistory.length - 1)] || null;
+  const earthAuthState = getAuthoritativeBodyState("earth")?.state || null;
+  const marsAuthState = getAuthoritativeBodyState("mars")?.state || null;
+
+  const distToEarthKm = (curSCState && earthAuthState)
+    ? (Math.hypot(curSCState.position[0] - earthAuthState.position[0], curSCState.position[1] - earthAuthState.position[1]) / 1e3)
+    : 0.0;
+
+  const distToMarsKm = (curSCState && marsAuthState)
+    ? (Math.hypot(curSCState.position[0] - marsAuthState.position[0], curSCState.position[1] - marsAuthState.position[1]) / 1e3)
+    : 0.0;
 
   return (
     <div className="relative w-full h-full bg-black overflow-hidden select-none font-mono">
@@ -698,6 +726,19 @@ export const Sandbox2D: React.FC<Sandbox2DProps> = ({
         >
           Scale: {scaleMode}
         </button>
+
+        <button
+          onClick={() => setShowDebug(!showDebug)}
+          className={`px-2.5 py-1 text-xs border uppercase tracking-wider transition-colors ${
+            showDebug
+              ? "bg-emerald-950 text-emerald-400 border-emerald-600"
+              : "bg-black/80 text-neutral-400 border-neutral-800 hover:text-white"
+          }`}
+          title="Toggle Development Diagnostic Overlay (Phase 15)"
+        >
+          <Code2 className="w-3 h-3 inline mr-1" />
+          Debug HUD
+        </button>
       </div>
 
       {/* Top Right: Zoom & Framing Utilities */}
@@ -726,6 +767,75 @@ export const Sandbox2D: React.FC<Sandbox2DProps> = ({
           <Maximize2 className="w-3.5 h-3.5" />
         </button>
       </div>
+
+      {/* Phase 15: Development Diagnostic Overlay Panel */}
+      {showDebug && (
+        <div className="absolute bottom-14 right-3 w-80 bg-black/90 border border-emerald-500/60 p-3 text-[11px] text-emerald-300 font-mono z-20 shadow-2xl space-y-1.5">
+          <div className="flex justify-between items-center border-b border-emerald-800/80 pb-1 font-bold text-white">
+            <span>DIAGNOSTIC OVERLAY (PHASE 15)</span>
+            <span className="text-[9px] bg-emerald-900/60 text-emerald-300 px-1 border border-emerald-600">LIVE</span>
+          </div>
+
+          <div className="flex justify-between">
+            <span className="text-neutral-400">FRAME:</span>
+            <span className="text-amber-300 font-bold">{isHeliocentric ? "HELIOCENTRIC (ICRF)" : "GEOCENTRIC (ECI)"}</span>
+          </div>
+
+          <div className="flex justify-between">
+            <span className="text-neutral-400">POSITION UNITS:</span>
+            <span className="text-white font-bold">METERS (SI)</span>
+          </div>
+
+          <div className="flex justify-between">
+            <span className="text-neutral-400">SIM TIME:</span>
+            <span className="text-white font-bold">{simTimeSec.toFixed(0)} s ({(simTimeSec / 86400).toFixed(1)} days)</span>
+          </div>
+
+          <div className="border-t border-neutral-800 pt-1">
+            <div className="text-amber-400 font-bold mb-0.5">SUN:</div>
+            <div className="text-[10px] text-neutral-300">x: 0.00 km, y: 0.00 km</div>
+          </div>
+
+          {earthAuthState && (
+            <div className="border-t border-neutral-800 pt-1">
+              <div className="text-cyan-400 font-bold mb-0.5 flex justify-between">
+                <span>EARTH:</span>
+                <span className="text-white font-normal">dist: {distToEarthKm.toLocaleString(undefined, { maximumFractionDigits: 0 })} km</span>
+              </div>
+              <div className="text-[10px] text-neutral-300">
+                x: {(earthAuthState.position[0] / 1e3).toLocaleString(undefined, { maximumFractionDigits: 0 })} km, y: {(earthAuthState.position[1] / 1e3).toLocaleString(undefined, { maximumFractionDigits: 0 })} km
+              </div>
+            </div>
+          )}
+
+          {marsAuthState && (
+            <div className="border-t border-neutral-800 pt-1">
+              <div className="text-red-400 font-bold mb-0.5 flex justify-between">
+                <span>MARS:</span>
+                <span className="text-white font-normal">dist: {distToMarsKm.toLocaleString(undefined, { maximumFractionDigits: 0 })} km</span>
+              </div>
+              <div className="text-[10px] text-neutral-300">
+                x: {(marsAuthState.position[0] / 1e3).toLocaleString(undefined, { maximumFractionDigits: 0 })} km, y: {(marsAuthState.position[1] / 1e3).toLocaleString(undefined, { maximumFractionDigits: 0 })} km
+              </div>
+            </div>
+          )}
+
+          {curSCState && (
+            <div className="border-t border-neutral-800 pt-1">
+              <div className="text-amber-300 font-bold mb-0.5">SPACECRAFT:</div>
+              <div className="text-[10px] text-neutral-300">
+                x: {(curSCState.position[0] / 1e3).toLocaleString(undefined, { maximumFractionDigits: 0 })} km, y: {(curSCState.position[1] / 1e3).toLocaleString(undefined, { maximumFractionDigits: 0 })} km
+              </div>
+              <div className="text-[10px] text-emerald-400">speed: {(curSCState.speed / 1e3).toFixed(2)} km/s</div>
+            </div>
+          )}
+
+          <div className="border-t border-neutral-800 pt-1 flex justify-between text-[10px]">
+            <span className="text-neutral-400">TRAJECTORY SAMPLES:</span>
+            <span className="text-white font-bold">{stateHistory.length} states</span>
+          </div>
+        </div>
+      )}
 
       {/* Bottom Left: Simulation Timestamp & Object Counter */}
       <div className="absolute bottom-3 left-3 bg-black/85 border border-neutral-800 px-3 py-2 text-xs text-neutral-300 z-10">
