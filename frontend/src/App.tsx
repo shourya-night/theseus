@@ -15,8 +15,11 @@ import {
   SpacecraftTrack, 
   MultiConjunctionEvent, 
   PhysicalCollisionEvent,
-  RocketPreset 
+  RocketPreset,
+  ActiveRocket,
+  ActiveExplosion
 } from "./types/mission";
+import { getRocketStateAtTime } from "./lib/simulationClock";
 import { CELESTIAL_BODIES } from "./data/celestialCatalog";
 import { ROCKET_PRESETS } from "./data/rocketPresets";
 import { 
@@ -27,6 +30,7 @@ import {
   simulateLambert, 
   simulateRendezvous, 
   simulateMultiEnvironment,
+  simulateIntercept,
   fetchDemoMission 
 } from "./api/client";
 import { formatSpeed, formatDistance, formatMass } from "./lib/formatter";
@@ -76,6 +80,10 @@ export function App() {
   const [selectedPresetId, setSelectedPresetId] = useState<string>("isro-lvm3");
   const [payloadKg, setPayloadKg] = useState<number>(2500);
   const [epochDate, setEpochDate] = useState<string>("2026-08-18");
+
+  // Multi-Rocket Active Fleet State
+  const [activeRockets, setActiveRockets] = useState<ActiveRocket[]>([]);
+  const [activeExplosions, setActiveExplosions] = useState<ActiveExplosion[]>([]);
 
   // Multi-Spacecraft Fleet State
   const [fleetList, setFleetList] = useState<SpacecraftConfig[]>([
@@ -236,12 +244,14 @@ export function App() {
     }
   };
 
-  // Execute Single-Spacecraft Interplanetary Mission Simulation
+  // Execute Single-Spacecraft Interplanetary Mission Simulation (Appends to activeRockets)
   const handleRunSingleSimulation = async (
     targetOrigin: string = origin,
     targetDest: string = destination,
     presetId: string = selectedPresetId,
-    payloadMass: number = payloadKg
+    payloadMass: number = payloadKg,
+    collisionEnabled: boolean = false,
+    collisionTargetId: string | null = null
   ) => {
     setIsLoading(true);
     setSimulationError(null);
@@ -261,7 +271,24 @@ export function App() {
 
       let result: SimulationResult;
 
-      if (origKey === "earth" && destKey === "moon") {
+      if (collisionEnabled && collisionTargetId) {
+        const targetRocket = activeRockets.find((r) => r.id === collisionTargetId);
+        if (!targetRocket || !targetRocket.result.state_history || targetRocket.result.state_history.length === 0) {
+          throw new Error("NO VALID INTERCEPT FOUND: Selected collision target rocket has no state history.");
+        }
+
+        result = await simulateIntercept({
+          origin_body: origBody.name,
+          target_state_history: targetRocket.result.state_history,
+          central_body: "Sun",
+          dry_mass_kg: preset.dry_mass_kg + payloadMass,
+          fuel_mass_kg: preset.propellant_mass_kg,
+          specific_impulse_s: preset.specific_impulse_s,
+          thrust_n: preset.max_thrust_n,
+          min_future_time_s: 86400.0,
+        });
+
+      } else if (origKey === "earth" && destKey === "moon") {
         result = await simulateHohmann({
           r1_km: 6678.137,
           r2_km: 384400.0,
@@ -295,8 +322,6 @@ export function App() {
         const est_tof_s = Math.PI * Math.sqrt(Math.pow(a_tx_m, 3) / mu_sun);
         const est_tof_hours = Number((est_tof_s / 3600.0).toFixed(1));
 
-        // Placeholder vectors; the backend replaces these with authoritative
-        // ephemeris states when origin_body and destination_body are supplied.
         const r1_vector_km: [number, number, number] = [r1_km_val, 0, 0];
         const r2_vector_km: [number, number, number] = [0, r2_km_val, 0];
 
@@ -317,9 +342,32 @@ export function App() {
 
       result.metadata.origin = origKey;
       result.metadata.destination = destKey;
-      result.metadata.name = `${origBody.name} → ${destBody.name} Transfer`;
+      result.metadata.name = collisionEnabled ? `${origBody.name} → Target Intercept` : `${origBody.name} → ${destBody.name} Transfer`;
 
       setSimResult(result);
+
+      // Create Active Rocket representation
+      const COLORS = ["#ff9900", "#3388ff", "#00ffcc", "#ff33aa", "#ffcc00", "#aa55ff", "#00ffaa", "#ff5555"];
+      const nextIdx = activeRockets.length + 1;
+      const rocketId = `Rocket-${nextIdx}`;
+      const rocketName = `Rocket ${nextIdx} — ${origBody.name} → ${collisionEnabled ? "Target Intercept" : destBody.name}`;
+      const color = COLORS[(nextIdx - 1) % COLORS.length];
+
+      const newRocket: ActiveRocket = {
+        id: rocketId,
+        name: rocketName,
+        origin: origKey,
+        destination: destKey,
+        presetId: preset.id,
+        presetName: preset.name,
+        color: color,
+        result: result,
+        collisionEnabled: collisionEnabled,
+        collisionTargetId: collisionTargetId,
+        collisionState: collisionEnabled && collisionTargetId ? "TARGETING" : "NONE",
+      };
+
+      setActiveRockets((prev) => [...prev, newRocket]);
       setCurrentFrameIdx(0);
       setIsPlaying(true);
     } catch (err: any) {
@@ -336,7 +384,12 @@ export function App() {
   let totalFrames = 0;
   let activeSelectedTrack: SpacecraftTrack | null = null;
 
-  if (simMode === "MULTI" && multiSimResult && multiSimResult.objects.length > 0) {
+  if (activeRockets.length > 0 && activeRockets[0].result?.state_history?.length > 0) {
+    totalFrames = activeRockets[0].result.state_history.length;
+    const clampedIdx = Math.min(currentFrameIdx, totalFrames - 1);
+    currentTimeSec = activeRockets[0].result.state_history[clampedIdx]?.time_seconds || 0;
+    totalDurationSec = Math.max(...activeRockets.map((r) => r.result?.state_history ? r.result.state_history[r.result.state_history.length - 1]?.time_seconds || 0 : 0));
+  } else if (simMode === "MULTI" && multiSimResult && multiSimResult.objects.length > 0) {
     totalFrames = multiSimResult.objects[0].state_history.length;
     const clampedIdx = Math.min(currentFrameIdx, totalFrames - 1);
     currentTimeSec = multiSimResult.objects[0].state_history[clampedIdx]?.time_seconds || 0;
@@ -348,6 +401,74 @@ export function App() {
     currentTimeSec = simResult.state_history[clampedIdx]?.time_seconds || 0;
     totalDurationSec = simResult.state_history[totalFrames - 1]?.time_seconds || 0;
   }
+
+  // Pairwise Collision & Sun Hazard Monitor Loop (Evaluates positions using universal simulation clock currentTimeSec)
+  useEffect(() => {
+    if (activeRockets.length === 0) return;
+
+    activeRockets.forEach((rA) => {
+      const stA = getRocketStateAtTime(rA, currentTimeSec);
+      if (!stA) return;
+
+      // 1. Sun Collision Check (|R_rocket(t)| < 2.0e9 m)
+      const distSun = Math.hypot(stA.position[0], stA.position[1], stA.position[2]);
+      if (distSun < 2.0e9 && rA.collisionState !== "DESTROYED_BY_SUN") {
+        setActiveRockets((prev) =>
+          prev.map((r) => (r.id === rA.id ? { ...r, collisionState: "DESTROYED_BY_SUN" } : r))
+        );
+        return; // Deterministic priority: Sun destruction takes precedence over rocket-rocket collision
+      }
+
+      // 2. Rocket-Rocket Collision Check (t >= 86400s)
+      if (!rA.collisionEnabled || !rA.collisionTargetId || rA.collisionState === "COLLIDED" || rA.collisionState === "DESTROYED_BY_SUN") return;
+
+      const rB = activeRockets.find((r) => r.id === rA.collisionTargetId);
+      if (!rB || rB.collisionState === "DESTROYED_BY_SUN") return;
+
+      const stB = getRocketStateAtTime(rB, currentTimeSec);
+      if (!stB) return;
+
+      // Enforce minimum future time (> 86400s / 1 day) to prevent initial launch overlap false collision
+      if (currentTimeSec < 86400.0) return;
+
+      const distM = Math.hypot(
+        stA.position[0] - stB.position[0],
+        stA.position[1] - stB.position[1],
+        stA.position[2] - stB.position[2]
+      );
+
+      // Separate Solver Tolerance (5e9 m) from Visual Collision Radius (5e7 m = 50,000 km)
+      const COLLISION_RADIUS_M = 5e7;
+
+      if (distM <= COLLISION_RADIUS_M) {
+        console.log(`[INTERCEPT PLAYBACK] Sim Time: ${currentTimeSec.toFixed(1)}s | Target Pos: [${stB.position.map(n => n.toFixed(0)).join(", ")}] | Interceptor Pos: [${stA.position.map(n => n.toFixed(0)).join(", ")}] | Runtime Separation: ${distM.toFixed(0)} m`);
+
+        // Mark collision state exactly once
+        setActiveRockets((prev) =>
+          prev.map((r) => {
+            if (r.id === rA.id || r.id === rB.id) {
+              return {
+                ...r,
+                collisionState: "COLLIDED",
+                collisionTimeSec: currentTimeSec,
+                collisionPosM: stA.position,
+              };
+            }
+            return r;
+          })
+        );
+
+        // Spawn active retro pixel explosion
+        const newExplosion: ActiveExplosion = {
+          id: `exp-${rA.id}-${rB.id}-${currentTimeSec}`,
+          positionM: stA.position,
+          startTimeSec: currentTimeSec,
+          durationSec: 1.2,
+        };
+        setActiveExplosions((prev) => [...prev, newExplosion]);
+      }
+    });
+  }, [currentTimeSec, activeRockets]);
 
   // Jump to specific time (e.g. TCA)
   const handleJumpToTime = (targetTimeSec: number) => {
@@ -396,12 +517,20 @@ export function App() {
             setSelectedPresetId(config.presetId);
             setPayloadKg(config.payloadKg);
             setEpochDate(config.epochDate);
-            handleRunSingleSimulation(config.origin, config.destination, config.presetId, config.payloadKg);
+            handleRunSingleSimulation(
+              config.origin,
+              config.destination,
+              config.presetId,
+              config.payloadKg,
+              config.collisionEnabled,
+              config.collisionTargetId
+            );
           }}
           currentOrigin={origin}
           currentDestination={destination}
           currentPresetId={selectedPresetId}
           currentPayloadKg={payloadKg}
+          activeRockets={activeRockets}
         />
 
         <BPlaneRiskOverlay
@@ -668,6 +797,9 @@ export function App() {
           {/* Canvas Sandbox */}
           <div className="flex-1 relative h-full">
             <Sandbox2D
+              activeRockets={activeRockets}
+              activeExplosions={activeExplosions}
+              simTimeSec={currentTimeSec}
               multiSimResult={simMode === "MULTI" ? multiSimResult : null}
               stateHistory={simMode === "SINGLE" ? (simResult?.state_history || []) : []}
               targetStateHistory={simMode === "SINGLE" ? simResult?.target_state_history : undefined}

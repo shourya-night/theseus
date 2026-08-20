@@ -186,3 +186,26 @@ export async function fetchDemoMission(demoId: string): Promise<SimulationResult
   }
   return await res.json();
 }
+
+export async function simulateIntercept(payload: {
+  origin_body: string;
+  target_state_history: any[];
+  central_body?: string;
+  dry_mass_kg: number;
+  fuel_mass_kg: number;
+  specific_impulse_s: number;
+  thrust_n: number;
+  min_future_time_s?: number;
+}): Promise<SimulationResult> {
+  const res = await fetch(`${API_BASE_URL}/simulate/intercept`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload),
+  });
+  if (!res.ok) {
+    const errObj = await res.json().catch(() => null);
+    const detailMsg = errObj?.detail || (await res.text().catch(() => ""));
+    throw new Error(detailMsg || `Intercept Calculation Failed (HTTP ${res.status})`);
+  }
+  return await res.json();
+}

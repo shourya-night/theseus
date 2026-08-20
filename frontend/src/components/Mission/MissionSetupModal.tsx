@@ -1,5 +1,5 @@
 import React, { useState } from "react";
-import { RocketPreset } from "../../types/mission";
+import { ActiveRocket, RocketPreset } from "../../types/mission";
 import { ROCKET_PRESETS } from "../../data/rocketPresets";
 import { CELESTIAL_BODIES } from "../../data/celestialCatalog";
 import { 
@@ -15,7 +15,8 @@ import {
   CheckCircle2,
   Calendar,
   Layers,
-  Settings2
+  Settings2,
+  Target
 } from "lucide-react";
 
 interface MissionSetupModalProps {
@@ -31,11 +32,14 @@ interface MissionSetupModalProps {
     enableJ2: boolean;
     enableDrag: boolean;
     enableSrp: boolean;
+    collisionEnabled: boolean;
+    collisionTargetId: string | null;
   }) => void;
   currentOrigin: string;
   currentDestination: string;
   currentPresetId: string;
   currentPayloadKg: number;
+  activeRockets?: ActiveRocket[];
 }
 
 export const MissionSetupModal: React.FC<MissionSetupModalProps> = ({
@@ -46,6 +50,7 @@ export const MissionSetupModal: React.FC<MissionSetupModalProps> = ({
   currentDestination,
   currentPresetId,
   currentPayloadKg,
+  activeRockets = [],
 }) => {
   const [origin, setOrigin] = useState<string>(currentOrigin || "earth");
   const [destination, setDestination] = useState<string>(currentDestination || "mars");
@@ -58,6 +63,10 @@ export const MissionSetupModal: React.FC<MissionSetupModalProps> = ({
   const [enableJ2, setEnableJ2] = useState<boolean>(true);
   const [enableDrag, setEnableDrag] = useState<boolean>(false);
   const [enableSrp, setEnableSrp] = useState<boolean>(true);
+
+  // Collision Setup state
+  const [collisionEnabled, setCollisionEnabled] = useState<boolean>(false);
+  const [collisionTargetId, setCollisionTargetId] = useState<string | null>(null);
 
   if (!isOpen) return null;
 
@@ -81,6 +90,8 @@ export const MissionSetupModal: React.FC<MissionSetupModalProps> = ({
       enableJ2,
       enableDrag,
       enableSrp,
+      collisionEnabled,
+      collisionTargetId: collisionEnabled ? collisionTargetId : null,
     });
     onClose();
   };
@@ -317,6 +328,67 @@ export const MissionSetupModal: React.FC<MissionSetupModalProps> = ({
                 />
                 <span className="text-[#aaaaaa]">Solar Radiation (SRP)</span>
               </label>
+            </div>
+          </div>
+
+          {/* Section 5: Target Rocket Collision Configuration */}
+          <div className="space-y-2">
+            <div className="text-[10.5px] text-[#ff9900] font-bold tracking-wider uppercase flex items-center space-x-1.5">
+              <Target className="w-3.5 h-3.5 text-[#ff3333]" />
+              <span>04. TARGETED ROCKET COLLISION SETUP</span>
+            </div>
+
+            <div className="bg-[#050505] p-3 rounded border border-[#1c1c1c] space-y-3">
+              <div className="flex items-center justify-between">
+                <label className="text-xs text-[#ffffff] font-semibold flex items-center space-x-2">
+                  <Flame className="w-3.5 h-3.5 text-[#ff3333]" />
+                  <span>ENABLE ROCKET COLLISION MODE</span>
+                </label>
+                <button
+                  type="button"
+                  onClick={() => {
+                    const next = !collisionEnabled;
+                    setCollisionEnabled(next);
+                    if (next && activeRockets.length > 0) {
+                      setCollisionTargetId(activeRockets[0].id);
+                    } else {
+                      setCollisionTargetId(null);
+                    }
+                  }}
+                  className={`px-3 py-1 text-xs font-bold rounded border tracking-wider transition-colors cursor-pointer ${
+                    collisionEnabled
+                      ? "bg-[#ff3333]/20 text-[#ff4444] border-[#ff3333]"
+                      : "bg-[#0d0d0d] text-[#888888] border-[#222222] hover:text-[#ffffff]"
+                  }`}
+                >
+                  COLLISION: {collisionEnabled ? "ON" : "OFF"}
+                </button>
+              </div>
+
+              {collisionEnabled && (
+                <div>
+                  <label className="block text-[#888888] text-[10px] mb-1 font-semibold">
+                    SELECT COLLISION TARGET ROCKET
+                  </label>
+                  {activeRockets.length > 0 ? (
+                    <select
+                      value={collisionTargetId || ""}
+                      onChange={(e) => setCollisionTargetId(e.target.value || null)}
+                      className="w-full bg-[#0d0d0d] text-[#ffffff] border border-[#ff3333]/60 p-2 rounded focus:border-[#ff3333] outline-none text-xs font-mono"
+                    >
+                      {activeRockets.map((r) => (
+                        <option key={r.id} value={r.id}>
+                          {r.name} ({r.origin.toUpperCase()} → {r.destination.toUpperCase()})
+                        </option>
+                      ))}
+                    </select>
+                  ) : (
+                    <div className="text-[11px] text-[#ff9900] bg-[#1a1000] p-2 rounded border border-[#664400]">
+                      NO ACTIVE ROCKETS EXIST YET. LAUNCH ROCKET 1 FIRST, THEN LAUNCH ROCKET 2 WITH COLLISION ON TARGETING ROCKET 1.
+                    </div>
+                  )}
+                </div>
+              )}
             </div>
           </div>
 

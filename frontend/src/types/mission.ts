@@ -154,6 +154,29 @@ export interface SimulationResult {
   };
 }
 
+export interface ActiveRocket {
+  id: string;
+  name: string;
+  origin: string;
+  destination: string;
+  presetId: string;
+  presetName: string;
+  color: string;
+  result: SimulationResult;
+  collisionEnabled: boolean;
+  collisionTargetId: string | null;
+  collisionState: "NONE" | "TARGETING" | "COLLIDED" | "DESTROYED_BY_SUN";
+  collisionTimeSec?: number;
+  collisionPosM?: [number, number, number];
+}
+
+export interface ActiveExplosion {
+  id: string;
+  positionM: [number, number, number];
+  startTimeSec: number;
+  durationSec: number;
+}
+
 // ---------------------------------------------------------------------------
 // Multi-Spacecraft & Collision Environment Types (Phases 9 & 10 Integration)
 // ---------------------------------------------------------------------------
