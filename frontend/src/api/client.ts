@@ -117,6 +117,9 @@ export async function simulateLambert(payload: {
   fuel_mass_kg: number;
   specific_impulse_s: number;
   thrust_n: number;
+  origin_body?: string;
+  destination_body?: string;
+  epoch_jd?: number;
 }): Promise<SimulationResult> {
   const res = await fetch(`${API_BASE_URL}/simulate/lambert`, {
     method: "POST",

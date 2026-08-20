@@ -122,12 +122,24 @@ export interface SimulationMetadata {
   status: "SUCCESS" | "WARNING_INSUFFICIENT_FUEL" | "FAILED" | "SOLVER_FAILED";
 }
 
+export interface BodyStateHistory {
+  id: string;
+  name: string;
+  radius_m: number;
+  mu: number;
+  parent: string | null;
+  state_history: { time_seconds: number; position: [number, number, number]; velocity: [number, number, number] }[];
+}
+
 export interface SimulationResult {
   mission_id: string;
   metadata: SimulationMetadata;
   delta_v_budget: DeltaVBudget;
   propellant_budget: PropellantBudget;
   state_history: StateVector[];
+  bodies?: BodyStateHistory[];
+  spacecraft?: { id: string; name: string; position?: [number, number, number]; velocity?: [number, number, number]; mass_kg?: number; trajectory_id?: string; epoch_jd?: number; status: string }[];
+  trajectories?: { id: string; source: string; state_history: StateVector[] }[];
   chaser_state_history?: StateVector[];
   target_state_history?: StateVector[];
   calculation_trace: CalculationStep[];

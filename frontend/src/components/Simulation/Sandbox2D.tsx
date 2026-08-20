@@ -1,6 +1,7 @@
 import React, { useRef, useEffect, useState, useCallback } from "react";
 import { 
   StateVector, 
+  BodyStateHistory,
   MultiSimulationResult, 
   SpacecraftTrack, 
   MultiConjunctionEvent, 
@@ -10,8 +11,6 @@ import {
   CELESTIAL_BODIES, 
   AU_KM, 
   AU_METERS, 
-  getPlanetStateAtTime, 
-  PLANETARY_ORBITAL_ELEMENTS 
 } from "../../data/celestialCatalog";
 import { 
   renderStarField, 
@@ -43,6 +42,7 @@ export type ScaleMode = "DISPLAY" | "TRUE";
 interface Sandbox2DProps {
   stateHistory?: StateVector[];
   targetStateHistory?: StateVector[];
+  bodyHistories?: BodyStateHistory[];
   multiSimResult?: MultiSimulationResult | null;
   currentFrameIdx: number;
   originBodyName?: string;
@@ -57,6 +57,7 @@ interface Sandbox2DProps {
 export const Sandbox2D: React.FC<Sandbox2DProps> = ({
   stateHistory = [],
   targetStateHistory,
+  bodyHistories = [],
   multiSimResult,
   currentFrameIdx,
   originBodyName = "earth",
@@ -117,6 +118,18 @@ export const Sandbox2D: React.FC<Sandbox2DProps> = ({
   const origBody = CELESTIAL_BODIES[origKey] || CELESTIAL_BODIES["earth"];
   const destBody = CELESTIAL_BODIES[destKey] || CELESTIAL_BODIES["mars"];
   const isHeliocentric = (origBody.parent === "Sun" && destBody.parent === "Sun") || origKey === "sun";
+
+  const getAuthoritativeBodyState = useCallback((bodyKey: string) => {
+    const body = bodyHistories.find((b) => b.id === bodyKey.toLowerCase() || b.name.toLowerCase() === bodyKey.toLowerCase());
+    if (!body || body.state_history.length === 0) return null;
+    let best = body.state_history[0];
+    let bestDt = Math.abs(best.time_seconds - simTimeSec);
+    for (const state of body.state_history) {
+      const dt = Math.abs(state.time_seconds - simTimeSec);
+      if (dt < bestDt) { best = state; bestDt = dt; }
+    }
+    return { body, state: best };
+  }, [bodyHistories, simTimeSec]);
 
   // 1. Fit Full Solar System View (Frames Sun to Neptune, ~65 AU)
   const fitSystem = useCallback(() => {
@@ -339,39 +352,25 @@ export const Sandbox2D: React.FC<Sandbox2DProps> = ({
       drawPixelPlanet(ctx, "Sun", sunRad, "Sun");
       ctx.restore();
 
-      // 2. Draw all 8 planetary orbits (Keplerian Ellipses) + bodies
-      const allPlanets = ["mercury", "venus", "earth", "mars", "jupiter", "saturn", "uranus", "neptune"];
-      
-      allPlanets.forEach((pKey) => {
-        const pState = getPlanetStateAtTime(pKey, simTimeSec);
-        if (!pState || pState.orbitalPathM.length === 0) return;
-
-        // Draw true elliptical Keplerian orbit path with Sun at primary focus
+      // 2. Draw backend-provided planetary histories and current bodies.
+      bodyHistories.forEach((history) => {
+        if (history.id === "sun" || history.state_history.length === 0) return;
         ctx.strokeStyle = "rgba(120, 120, 120, 0.35)";
         ctx.setLineDash([2, 4]);
         ctx.lineWidth = 0.8;
         ctx.beginPath();
-        pState.orbitalPathM.forEach(([ox, oy], idx) => {
-          const s = worldToScreen(ox, oy, width, height);
-          if (idx === 0) ctx.moveTo(s.x, s.y);
-          else ctx.lineTo(s.x, s.y);
+        history.state_history.forEach((sample, idx) => {
+          const s = worldToScreen(sample.position[0], sample.position[1], width, height);
+          if (idx === 0) ctx.moveTo(s.x, s.y); else ctx.lineTo(s.x, s.y);
         });
-        ctx.closePath();
         ctx.stroke();
         ctx.setLineDash([]);
-
-        // Draw Planet at its physical dynamic position
-        const ps = worldToScreen(pState.positionM[0], pState.positionM[1], width, height);
-
-        let pr = 3;
-        if (["jupiter", "saturn"].includes(pKey)) pr = 6;
-        else if (["uranus", "neptune"].includes(pKey)) pr = 5;
-        else if (pKey === "mercury") pr = 2;
-
-        const body = CELESTIAL_BODIES[pKey];
+        const current = getAuthoritativeBodyState(history.id)?.state || history.state_history[0];
+        const ps = worldToScreen(current.position[0], current.position[1], width, height);
+        const pr = scaleMode === "DISPLAY" ? (history.id === "jupiter" ? 7 : 5) : Math.max(3, history.radius_m * camera.zoom);
         ctx.save();
         ctx.translate(ps.x, ps.y);
-        drawPixelPlanet(ctx, body ? body.name : pKey, pr, body ? body.name : pKey, true);
+        drawPixelPlanet(ctx, history.name, pr, history.name, true);
         ctx.restore();
       });
 
@@ -404,34 +403,26 @@ export const Sandbox2D: React.FC<Sandbox2DProps> = ({
       drawPixelPlanet(ctx, centralBody.name, bRad, centralBody.name);
       ctx.restore();
 
-      // If Sun is central body, draw the planetary Keplerian paths and dynamic planets
+      // If Sun is central body, draw backend-provided planetary histories and current bodies.
       if (centralBodyKey === "sun") {
-        const planetsToDraw = ["mercury", "venus", "earth", "mars", "jupiter", "saturn"];
-        planetsToDraw.forEach((pKey) => {
-          const pState = getPlanetStateAtTime(pKey, simTimeSec);
-          if (!pState.orbitalPathM.length) return;
-
-          // Draw Elliptical Orbit Path
+        bodyHistories.forEach((history) => {
+          if (history.id === "sun" || history.state_history.length === 0) return;
           ctx.strokeStyle = "rgba(140, 140, 140, 0.35)";
           ctx.setLineDash([2, 4]);
           ctx.lineWidth = 0.9;
           ctx.beginPath();
-          pState.orbitalPathM.forEach(([ox, oy], idx) => {
-            const s = worldToScreen(ox, oy, width, height);
-            if (idx === 0) ctx.moveTo(s.x, s.y);
-            else ctx.lineTo(s.x, s.y);
+          history.state_history.forEach((sample, idx) => {
+            const pt = worldToScreen(sample.position[0], sample.position[1], width, height);
+            if (idx === 0) ctx.moveTo(pt.x, pt.y); else ctx.lineTo(pt.x, pt.y);
           });
-          ctx.closePath();
           ctx.stroke();
           ctx.setLineDash([]);
-
-          // Draw Planet at its physical dynamic position
-          const ps = worldToScreen(pState.positionM[0], pState.positionM[1], width, height);
-          const pr = scaleMode === "DISPLAY" ? (["jupiter", "saturn"].includes(pKey) ? 7 : 5) : Math.max(3, (CELESTIAL_BODIES[pKey]?.radius_km || 6000) * 1000.0 * camera.zoom);
-          const body = CELESTIAL_BODIES[pKey];
+          const current = getAuthoritativeBodyState(history.id)?.state || history.state_history[0];
+          const ps = worldToScreen(current.position[0], current.position[1], width, height);
+          const pr = scaleMode === "DISPLAY" ? (history.id === "jupiter" ? 7 : 5) : Math.max(3, history.radius_m * camera.zoom);
           ctx.save();
           ctx.translate(ps.x, ps.y);
-          drawPixelPlanet(ctx, body ? body.name : pKey, pr, body ? body.name : pKey, true);
+          drawPixelPlanet(ctx, history.name, pr, history.name, true);
           ctx.restore();
         });
       }
@@ -636,6 +627,8 @@ export const Sandbox2D: React.FC<Sandbox2DProps> = ({
     simTimeSec,
     multiSimResult,
     stateHistory,
+    bodyHistories,
+    getAuthoritativeBodyState,
     selectedObjectId,
     originBodyName,
     spacecraftPresetId,

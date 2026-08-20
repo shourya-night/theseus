@@ -17,7 +17,7 @@ import {
   PhysicalCollisionEvent,
   RocketPreset 
 } from "./types/mission";
-import { CELESTIAL_BODIES, AU_KM, getPlanetStateAtTime } from "./data/celestialCatalog";
+import { CELESTIAL_BODIES } from "./data/celestialCatalog";
 import { ROCKET_PRESETS } from "./data/rocketPresets";
 import { 
   checkBackendHealth, 
@@ -295,16 +295,10 @@ export function App() {
         const est_tof_s = Math.PI * Math.sqrt(Math.pow(a_tx_m, 3) / mu_sun);
         const est_tof_hours = Number((est_tof_s / 3600.0).toFixed(1));
 
-        const origState0 = getPlanetStateAtTime(origKey, 0);
-        const destStateArrival = getPlanetStateAtTime(destKey, est_tof_s);
-
-        const r1_vector_km: [number, number, number] = origState0 
-          ? [origState0.positionM[0] / 1e3, origState0.positionM[1] / 1e3, 0]
-          : [r1_km_val, 0, 0];
-
-        const r2_vector_km: [number, number, number] = destStateArrival
-          ? [destStateArrival.positionM[0] / 1e3, destStateArrival.positionM[1] / 1e3, 0]
-          : [0, r2_km_val, 0];
+        // Placeholder vectors; the backend replaces these with authoritative
+        // ephemeris states when origin_body and destination_body are supplied.
+        const r1_vector_km: [number, number, number] = [r1_km_val, 0, 0];
+        const r2_vector_km: [number, number, number] = [0, r2_km_val, 0];
 
         result = await simulateLambert({
           r1_km: r1_vector_km,
@@ -316,6 +310,8 @@ export function App() {
           fuel_mass_kg: preset.propellant_mass_kg,
           specific_impulse_s: preset.specific_impulse_s,
           thrust_n: preset.max_thrust_n,
+          origin_body: origBody.name,
+          destination_body: destBody.name,
         });
       }
 
@@ -675,6 +671,7 @@ export function App() {
               multiSimResult={simMode === "MULTI" ? multiSimResult : null}
               stateHistory={simMode === "SINGLE" ? (simResult?.state_history || []) : []}
               targetStateHistory={simMode === "SINGLE" ? simResult?.target_state_history : undefined}
+              bodyHistories={simMode === "SINGLE" ? simResult?.bodies : undefined}
               currentFrameIdx={currentFrameIdx}
               originBodyName={simMode === "SINGLE" ? (simResult?.metadata.origin || origin) : "Earth"}
               destinationBodyName={simMode === "SINGLE" ? (simResult?.metadata.destination || destination) : "Mars"}
