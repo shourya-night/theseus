@@ -93,6 +93,78 @@ simple_ephemeris = SimpleEphemerisProvider()
 astropy_ephemeris = AstropyEphemerisProvider()
 
 
+
+def _safe_ephemeris_state(body_name: str, epoch_jd: float, *, heliocentric: bool = False) -> tuple[np.ndarray, np.ndarray]:
+    """Return backend ephemeris state in SI units."""
+    if heliocentric:
+        return simple_ephemeris.get_state(body_name, epoch_jd)
+    try:
+        return astropy_ephemeris.get_state(body_name, epoch_jd)
+    except Exception:
+        return simple_ephemeris.get_state(body_name, epoch_jd)
+
+
+def _sample_body_history(body_names: list[str], epoch_jd: float, times_s: np.ndarray) -> list[dict[str, Any]]:
+    """Serialize backend-owned heliocentric planetary states on the simulation clock."""
+    histories = []
+    for body_name in body_names:
+        body = get_body(body_name)
+        states = []
+        for t in times_s:
+            pos_m, vel_m_s = _safe_ephemeris_state(body.name, epoch_jd + float(t) / 86400.0, heliocentric=True)
+            states.append({
+                "time_seconds": float(t),
+                "position": [float(pos_m[0]), float(pos_m[1]), float(pos_m[2])],
+                "velocity": [float(vel_m_s[0]), float(vel_m_s[1]), float(vel_m_s[2])],
+            })
+        histories.append({
+            "id": body.name.lower(),
+            "name": body.name,
+            "radius_m": float(body.radius),
+            "mu": float(body.mu),
+            "parent": body.parent_name,
+            "state_history": states,
+        })
+    return histories
+
+
+def _health_check_subsystems() -> dict[str, str]:
+    """Execute minimal physical smoke tests; ONLINE means runnable, not importable."""
+    checks: dict[str, str] = {}
+    try:
+        assert abs(EARTH.mu - G_VAL * EARTH.mass) / EARTH.mu < 5e-4
+        checks["core_engine"] = "ONLINE"
+    except Exception as exc:
+        checks["core_engine"] = f"FAILED: {exc}"
+    try:
+        r0 = np.array([7000e3, 0.0, 0.0])
+        v0 = np.array([0.0, math.sqrt(EARTH.mu / 7000e3), 0.0])
+        period = 2 * math.pi * math.sqrt((7000e3) ** 3 / EARTH.mu)
+        hist = propagate_twobody(r0, v0, EARTH.mu, [0.0, period])
+        assert np.linalg.norm(hist[-1].position - r0) < 1e3
+        checks["propagator"] = "ONLINE"
+    except Exception as exc:
+        checks["propagator"] = f"FAILED: {exc}"
+    try:
+        r1 = np.array([7000e3, 0.0, 0.0])
+        r2 = np.array([0.0, 7000e3, 0.0])
+        tof = 0.5 * math.pi * math.sqrt((7000e3) ** 3 / EARTH.mu)
+        sol = solve_lambert(r1, r2, tof, EARTH.mu)
+        assert sol.converged
+        checks["transfers"] = "ONLINE"
+    except Exception as exc:
+        checks["transfers"] = f"FAILED: {exc}"
+    try:
+        theta = 0.3
+        res = solve_rendezvous(np.array([6778e3, 0.0, 0.0]), np.array([0.0, 7668.0, 0.0]), np.array([6778e3 * math.cos(theta), 6778e3 * math.sin(theta), 0.0]), np.array([-7668.0 * math.sin(theta), 7668.0 * math.cos(theta), 0.0]), 1800.0, EARTH.mu)
+        assert res.lambert_solution.converged
+        checks["rendezvous"] = "ONLINE"
+    except Exception as exc:
+        checks["rendezvous"] = f"FAILED: {exc}"
+    for key in ["reentry", "conjunction", "uncertainty"]:
+        checks[key] = "STANDBY"
+    return checks
+
 # ---------------------------------------------------------------------------
 # Request / Response Schemas
 # ---------------------------------------------------------------------------
@@ -118,6 +190,9 @@ class LambertRequest(BaseModel):
     fuel_mass_kg: float = Field(5000.0)
     specific_impulse_s: float = Field(325.0)
     thrust_n: float = Field(450.0)
+    origin_body: Optional[str] = Field(None, description="Departure planet/body for authoritative ephemeris")
+    destination_body: Optional[str] = Field(None, description="Arrival planet/body for authoritative ephemeris")
+    epoch_jd: float = Field(JD_J2000, description="Departure epoch as Julian Date")
 
 
 class RendezvousRequest(BaseModel):
@@ -158,33 +233,15 @@ class PropagationRequest(BaseModel):
 
 @app.get("/api/health")
 def get_health() -> Dict[str, Any]:
-    """Return backend health, engine version, and active validated subsystems."""
+    """Return backend health from executable subsystem smoke tests."""
+    subsystems = _health_check_subsystems()
+    online = all(subsystems.get(key) == "ONLINE" for key in ("core_engine", "propagator", "transfers", "rendezvous"))
     return {
-        "status": "ONLINE",
+        "status": "ONLINE" if online else "DEGRADED",
         "engine": "THESEUS Astrodynamics Engine",
         "version": "0.1.0",
         "timestamp": datetime.now(timezone.utc).isoformat(),
-        "subsystems": {
-            "constants": "VALIDATED",
-            "coordinates": "VALIDATED",
-            "orbital_mechanics": "VALIDATED",
-            "analytical_propagation": "VALIDATED",
-            "numerical_propagation": "VALIDATED (RK4 / RKF45 7-DOF)",
-            "lambert_solver": "VALIDATED (Universal Variables)",
-            "rendezvous_guidance": "VALIDATED",
-            "gravity_j2": "VALIDATED",
-            "solar_radiation_pressure": "VALIDATED",
-            "aerodynamic_drag": "VALIDATED (US 1976 / Co-rotating)",
-            "ephemerides": "VALIDATED (Astropy DE440 / Analytical)",
-            "time_scales": "VALIDATED (IAU Epoch-dependent)",
-            "phase_8_reentry": "VALIDATED (2D Planar Entry / Sutton-Graves / RKF45)",
-            "phase_9_collision": "VALIDATED (Brent TCA / B-Plane / Deterministic)",
-            "phase_10_uncertainty": "VALIDATED (State Covariance / STM / 2D Gaussian Pc / B-Plane)",
-            "phase_10_monte_carlo": "VALIDATED (Validation-Only Cross-Check)",
-            "phase_11_stm": "VALIDATED (Variational Equations / Analytic Gravity & J2 / Numerical)",
-            "phase_12_optimization": "FUTURE PHYSICS MODULE",
-            "phase_13_environment": "FUTURE PHYSICS MODULE",
-        },
+        "subsystems": subsystems,
     }
 
 
@@ -461,6 +518,10 @@ def simulate_lambert(req: LambertRequest) -> Dict[str, Any]:
     r1 = np.array(req.r1_km) * 1e3
     r2 = np.array(req.r2_km) * 1e3
     tof_sec = req.tof_hours * 3600.0
+
+    if req.origin_body and req.destination_body and body.name.lower() == "sun":
+        r1, _ = _safe_ephemeris_state(req.origin_body, req.epoch_jd, heliocentric=True)
+        r2, _ = _safe_ephemeris_state(req.destination_body, req.epoch_jd + tof_sec / 86400.0, heliocentric=True)
 
     r1_mag = float(np.linalg.norm(r1))
     r2_mag = float(np.linalg.norm(r2))
@@ -809,6 +870,13 @@ def simulate_lambert(req: LambertRequest) -> Dict[str, Any]:
         {"time": float(tof_sec), "name": "MISSION INTERCEPT SUCCESS", "type": "MISSION_SUCCESS", "details": "Target rendezvous achieved"},
     ]
 
+    body_names = ["Sun"]
+    if req.origin_body:
+        body_names.append(req.origin_body)
+    if req.destination_body and req.destination_body.lower() not in [b.lower() for b in body_names]:
+        body_names.append(req.destination_body)
+    body_history_times = np.array([item["time_seconds"] for item in state_history])
+
     return {
         "mission_id": f"LAMBERT-{body.name.upper()}",
         "metadata": {
@@ -835,6 +903,9 @@ def simulate_lambert(req: LambertRequest) -> Dict[str, Any]:
             "fuel_margin_kg": float(fuel_margin),
         },
         "state_history": state_history,
+        "bodies": _sample_body_history(body_names, req.epoch_jd, body_history_times),
+        "spacecraft": [{"id": "SC-01", "name": "Transfer Vehicle", "epoch_jd": req.epoch_jd, "status": "ACTIVE", "trajectory_id": "primary", "mass_kg": float(m0)}],
+        "trajectories": [{"id": "primary", "source": "RKF45 propagation of Lambert v1", "state_history": state_history}],
         "calculation_trace": traces,
         "events": events,
         "diagnostics": {
