@@ -1,4 +1,4 @@
-import { ActiveRocket } from "../types/mission";
+import { ActiveRocket, BodyStateHistory } from "../types/mission";
 
 export interface InterpolatedRocketState {
   time_seconds: number;
@@ -116,6 +116,45 @@ export function getRocketStateAtTime(
     mass: st1.mass + frac * (st2.mass - st1.mass),
     fuel_mass: st1.fuel_mass + frac * (st2.fuel_mass - st1.fuel_mass),
     thrust_active: frac < 0.5 ? st1.thrust_active : st2.thrust_active,
+  };
+}
+
+/**
+ * Interpolate an ORBIT-X sampled body state on the same clock as a mission.
+ * This is display playback only: it deliberately performs no ephemeris or
+ * dynamics calculation in the frontend.
+ */
+export function getMissionBodyStateAtTime(
+  bodies: BodyStateHistory[] | undefined,
+  bodyId: string,
+  simTimeSec: number
+): { position: [number, number, number]; velocity: [number, number, number] } | null {
+  const history = bodies?.find(body => body.id.toLowerCase() === bodyId.toLowerCase())?.state_history;
+  if (!history?.length) return null;
+
+  if (simTimeSec <= history[0].time_seconds) {
+    return { position: [...history[0].position], velocity: [...history[0].velocity] };
+  }
+  const last = history[history.length - 1];
+  if (simTimeSec >= last.time_seconds) {
+    return { position: [...last.position], velocity: [...last.velocity] };
+  }
+
+  let low = 0;
+  let high = history.length - 1;
+  while (low <= high) {
+    const mid = (low + high) >> 1;
+    if (history[mid].time_seconds < simTimeSec) low = mid + 1;
+    else high = mid - 1;
+  }
+
+  const before = history[Math.max(0, high)];
+  const after = history[Math.min(history.length - 1, low)];
+  const dt = after.time_seconds - before.time_seconds;
+  const t = dt > 0 ? (simTimeSec - before.time_seconds) / dt : 0;
+  return {
+    position: [0, 1, 2].map(i => before.position[i] + (after.position[i] - before.position[i]) * t) as [number, number, number],
+    velocity: [0, 1, 2].map(i => before.velocity[i] + (after.velocity[i] - before.velocity[i]) * t) as [number, number, number],
   };
 }
 

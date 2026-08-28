@@ -10,32 +10,28 @@
  * `group.position` comes straight from the ORBIT-X state vector through the
  * canonical scale factor, with no adjustment of any kind. What the vehicle
  * looks like is decided separately: the geometry is built in unitless vehicle
- * units, and an inner group is scaled each frame by VisualScale so the craft
- * reaches a minimum apparent size on screen.
- *
- * In practice a real vehicle is a few metres across, which is ~1e-7 scene
- * units, so the minimum-size rule always binds and the drawn size is
- * effectively symbolic. The physical radius is still threaded through rather
- * than assumed away, so the two remain genuinely separate quantities — and if
- * the camera ever gets within a few hundred metres the multiplier collapses
- * to 1 and the vehicle renders true-size.
+ * units. Its inner group uses a camera-aware visual scale so it remains
+ * visible in solar-system view and drops to true detailed proportions in
+ * close-up spectator mode.
  */
 
 import * as THREE from 'three';
 import { SpacecraftGeometryBuilder } from './SpacecraftGeometry';
 import { ThrustPlumeRenderer } from './ThrustPlumeRenderer';
+import { MissionRenderFrame } from '../mission/MissionRenderFrame';
 import { StateVector } from '../../types/mission';
 import {
-  SCENE_SCALE,
   engineToThreePos,
-  engineToThreePosInto,
   engineToThreeVelInto,
 } from '../CoordinateSystem';
-import {
-  ViewContext,
-  MIN_APPARENT_RADIUS_PX,
-  visualRadiusScene,
-} from '../VisualScale';
+import { ViewContext, visualRadiusScene, MIN_APPARENT_RADIUS_PX } from '../VisualScale';
+
+/**
+ * Deliberately symbolic base model radius in scene units.
+ * Scaled per-frame by VisualScale to guarantee minimum apparent pixels on screen
+ * while remaining in true detailed proportions during close-up spectator inspection.
+ */
+const ROCKET_MODEL_RADIUS_SCENE = 0.02;
 
 export class SpacecraftRenderer {
   readonly group: THREE.Group;
@@ -48,6 +44,7 @@ export class SpacecraftRenderer {
   private currentQuat = new THREE.Quaternion();
   private targetQuat = new THREE.Quaternion();
   private _vel = new THREE.Vector3();
+  private _tempWorldPos = new THREE.Vector3();
   private static readonly NOSE_AXIS = new THREE.Vector3(0, 0, 1);
   private lineGeometry: THREE.BufferGeometry;
   private linePoints: THREE.Vector3[] = [];
@@ -60,27 +57,23 @@ export class SpacecraftRenderer {
    * Zero for a heliocentric mission. Applied as a translation to both the
    * vehicle and its trail, so the two can never disagree.
    */
-  private frameOrigin = new THREE.Vector3();
-
-  /**
-   * True characteristic radius of the vehicle in scene units, when known.
-   * Null means no catalogued size, so the drawn size is purely symbolic.
-   */
-  private physicalRadiusScene: number | null = null;
+  private readonly missionFrame = new MissionRenderFrame();
 
   constructor(type = 'falcon9', color = '#c9a05a') {
     this.group = new THREE.Group();
-    this.group.name = `SpacecraftGroup_${type}`;
+    this.group.name = 'RocketGroup';
 
     this.scaleGroup = new THREE.Group();
-    this.scaleGroup.name = 'SpacecraftScale';
+    this.scaleGroup.name = 'RocketVisualScale';
     this.group.add(this.scaleGroup);
 
     // ── 1. Vehicle 3D mesh (unitless vehicle units) ───────────────
     this.vehicleMesh = SpacecraftGeometryBuilder.buildVehicleGroup({
       type,
       color,
-      showSolarPanels: true,
+      // A transfer vehicle is rendered as a launch vehicle, not as a generic
+      // satellite with wings. Keep the silhouette legible at pixel scale.
+      showSolarPanels: false,
       showDishAntenna: type.includes('voyager') || type.includes('probe'),
     });
     this.scaleGroup.add(this.vehicleMesh);
@@ -98,21 +91,16 @@ export class SpacecraftRenderer {
     // ── 3. Trajectory line (world scale, never exaggerated) ───────
     this.lineGeometry = new THREE.BufferGeometry();
     const lineMat = new THREE.LineBasicMaterial({
-      color: new THREE.Color(color),
+      color: new THREE.Color(color || 0xffaa00),
       transparent: true,
-      opacity: 0.85,
+      opacity: 0.95,
+      depthTest: true,
       depthWrite: false,
     });
     this.trajectoryLine = new THREE.Line(this.lineGeometry, lineMat);
     this.trajectoryLine.name = `TrajectoryLine_${type}`;
-  }
-
-  /**
-   * Supply the vehicle's true characteristic radius in metres, from the
-   * mission's rocket preset. Pass null when no size is catalogued.
-   */
-  setPhysicalRadiusMeters(radiusM: number | null): void {
-    this.physicalRadiusScene = radiusM !== null && radiusM > 0 ? radiusM * SCENE_SCALE : null;
+    this.trajectoryLine.frustumCulled = false;
+    this.trajectoryLine.renderOrder = 999;
   }
 
   /**
@@ -122,16 +110,9 @@ export class SpacecraftRenderer {
    * body's scene position here places the whole mission — vehicle and trail
    * together — in the right place, with a single translation rather than an
    * arithmetic offset applied separately in two places.
-   *
-   * APPROXIMATION: the trail is translated by the central body's position at
-   * the CURRENT time, not at each sample's own time. That is exact for a
-   * heliocentric mission and for any body-centred mission short enough that
-   * the central body barely moves. For a long body-centred trajectory the
-   * trail will lag; fixing that properly needs the per-sample body ephemeris
-   * that ORBIT-X can supply in `result.bodies`.
    */
   setFrameOrigin(originScene: THREE.Vector3): void {
-    this.frameOrigin.copy(originScene);
+    this.missionFrame.setOrigin(originScene);
     this.trajectoryLine.position.copy(originScene);
   }
 
@@ -143,8 +124,7 @@ export class SpacecraftRenderer {
    * remap, and the declared frame origin — nothing else. No nudges.
    */
   updateFrame(frame: StateVector, isThrustActive = false): void {
-    engineToThreePosInto(frame.position, this.group.position);
-    this.group.position.add(this.frameOrigin);
+    this.missionFrame.positionInto(frame.position, this.group.position);
 
     // Orient along the velocity vector, through the same canonical remap.
     const velVec = engineToThreeVelInto(frame.velocity, this._vel);
@@ -162,18 +142,24 @@ export class SpacecraftRenderer {
   }
 
   /**
-   * Apply the camera-relative legibility scale. Call once per frame, after
-   * updateFrame. Touches scale only — never position.
+   * Apply camera-aware spacecraft visual scale using VisualScale policy.
+   * Keeps the rocket visible on screen across vast solar system distances
+   * while dropping down to true symbolic model radius (0.02) during spectator
+   * close-up inspection.
    */
   updateVisualScale(ctx: ViewContext): void {
-    const physical = this.physicalRadiusScene ?? 0;
-    const drawnRadius = visualRadiusScene(
-      physical,
-      this.group.position,
+    if (!ctx?.camera) {
+      this.scaleGroup.scale.setScalar(ROCKET_MODEL_RADIUS_SCENE / this.unitRadius);
+      return;
+    }
+    this.group.getWorldPosition(this._tempWorldPos);
+    const targetRadius = visualRadiusScene(
+      ROCKET_MODEL_RADIUS_SCENE,
+      this._tempWorldPos,
       MIN_APPARENT_RADIUS_PX.SPACECRAFT,
       ctx
     );
-    this.scaleGroup.scale.setScalar(drawnRadius / this.unitRadius);
+    this.scaleGroup.scale.setScalar(targetRadius / this.unitRadius);
   }
 
   /**
@@ -184,12 +170,49 @@ export class SpacecraftRenderer {
    * than per frame.
    */
   updateTrajectoryHistory(history: StateVector[]): void {
+    if (!history || history.length === 0) return;
     this.linePoints = history.map(s => engineToThreePos(s.position));
     this.lineGeometry.setFromPoints(this.linePoints);
+    this.lineGeometry.computeBoundingSphere();
+    this.lineGeometry.computeBoundingBox();
+
+    if (import.meta.env.DEV) {
+      const posAttr = this.lineGeometry.attributes.position;
+      const count = posAttr.count;
+      const getV = (i: number) => [posAttr.getX(i), posAttr.getY(i), posAttr.getZ(i)];
+      const idx25 = Math.floor(count * 0.25);
+      const idx50 = Math.floor(count * 0.50);
+      const idx75 = Math.floor(count * 0.75);
+      const idxEnd = count - 1;
+
+      console.info('[THESEUS TrajectoryLine Geometry Diagnostic]', {
+        name: this.trajectoryLine.name,
+        vertexCount: count,
+        firstVertex: getV(0),
+        v25: getV(idx25),
+        v50: getV(idx50),
+        v75: getV(idx75),
+        finalVertex: getV(idxEnd),
+        localPosition: this.trajectoryLine.position.toArray(),
+        localRotation: [this.trajectoryLine.rotation.x, this.trajectoryLine.rotation.y, this.trajectoryLine.rotation.z],
+        localScale: this.trajectoryLine.scale.toArray(),
+        worldPosition: this.trajectoryLine.getWorldPosition(new THREE.Vector3()).toArray(),
+        parentName: this.trajectoryLine.parent?.name || 'Scene',
+        visible: this.trajectoryLine.visible,
+      });
+    }
   }
 
   setVisible(visible: boolean): void {
     this.group.visible = visible;
+    this.trajectoryLine.visible = visible;
+  }
+
+  setSpacecraftVisible(visible: boolean): void {
+    this.group.visible = visible;
+  }
+
+  setTrajectoryVisible(visible: boolean): void {
     this.trajectoryLine.visible = visible;
   }
 

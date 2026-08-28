@@ -86,7 +86,7 @@ export const DEFAULT_LAYER_STATE: LayerState = {
   // so at any planetary framing it reads as a stray grid sitting on the Sun.
   // Brief §34 also asks that reference frames not all be shown by default.
   referencePlanes: false,
-  forceVectors: true,
+  forceVectors: false,
   uncertainty: true,
 };
 

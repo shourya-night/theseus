@@ -395,7 +395,7 @@ export function App() {
         collisionState: collisionEnabled && collisionTargetId ? "TARGETING" : "NONE",
       };
 
-      setActiveRockets((prev) => [...prev, newRocket]);
+      setActiveRockets([newRocket]);
       setSimTimeSec(0);
       setIsPlaying(false);
       setIsBuildOverlayOpen(true);

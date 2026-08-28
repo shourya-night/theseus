@@ -777,7 +777,14 @@ def simulate_lambert(req: LambertRequest) -> Dict[str, Any]:
     # Subsample state history and compute true distance to moving target position r2
     state_history = []
     step_skip = max(1, len(int_res.times) // 200)
-    for idx in range(0, len(int_res.times), step_skip):
+    sample_indices = list(range(0, len(int_res.times), step_skip))
+    # Serialization adapter invariant: always expose the integrator's actual
+    # terminal sample. This changes no dynamics or Lambert result; it only
+    # prevents a subsampling stride from silently dropping the solved arrival
+    # state that the renderer must play back.
+    if sample_indices[-1] != len(int_res.times) - 1:
+        sample_indices.append(len(int_res.times) - 1)
+    for idx in sample_indices:
         t = int_res.times[idx]
         st = int_res.states[idx]
         pos = st[:3]

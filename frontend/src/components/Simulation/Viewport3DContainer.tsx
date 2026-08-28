@@ -18,7 +18,7 @@
  * runtime must follow the same pattern.
  */
 
-import React, { useEffect, useRef } from 'react';
+import React, { useCallback, useEffect, useRef, useState } from 'react';
 import * as THREE from 'three';
 import { SceneManager } from '../../renderer/SceneManager';
 import { CameraController } from '../../renderer/CameraController';
@@ -40,6 +40,7 @@ import { CentaurRenderer } from '../../renderer/populations/CentaurRenderer';
 import { ZodiacalDustRenderer } from '../../renderer/populations/ZodiacalDustRenderer';
 import { StarfieldRenderer } from '../../renderer/environment/StarfieldRenderer';
 import { SpacecraftRenderer } from '../../renderer/spacecraft/SpacecraftRenderer';
+import { MissionTargetRenderer } from '../../renderer/mission/MissionTargetRenderer';
 import { OrbitalOverlayRenderer } from '../../renderer/overlays/OrbitalOverlayRenderer';
 import { DynamicsOverlayRenderer } from '../../renderer/overlays/DynamicsOverlayRenderer';
 import { MissionOverlayRenderer } from '../../renderer/overlays/MissionOverlayRenderer';
@@ -53,9 +54,18 @@ import { SOLAR_SYSTEM_OBJECTS, getMoons } from '../../data/astronomicalObjects';
 // finds the 26 moons defined in moonSystems.ts.
 import '../../data/moonSystems';
 import { ActiveRocket } from '../../types/mission';
-import { getRocketStateAtTime } from '../../lib/simulationClock';
-import { ROCKET_PRESETS } from '../../data/rocketPresets';
-import { ViewContext, spacecraftCharacteristicRadiusM } from '../../renderer/VisualScale';
+import { getMissionBodyStateAtTime, getRocketStateAtTime } from '../../lib/simulationClock';
+import { ViewContext } from '../../renderer/VisualScale';
+import { engineToThreePos, orbitPosition, threeToEnginePos } from '../../renderer/CoordinateSystem';
+
+/**
+ * Resolve the scene position of the body an ORBIT-X state history is
+ * referenced to, from `metadata.central_body`.
+ *
+ * This replaces a string comparison on the mission's DESTINATION
+ * (`destination === 'orbit' | 'leo'`), which was wrong for every body-centred
+ * mission that was not an Earth orbit insertion — the state was then treated
+ * as heliocentric and the vehicle appeared a fraction of an AU from the Sun,
 
 /**
  * Resolve the scene position of the body an ORBIT-X state history is
@@ -88,7 +98,7 @@ interface Viewport3DContainerProps {
   focusedObjectId: string | null;
 }
 
-export const Viewport3DContainer: React.FC<Viewport3DContainerProps> = ({
+const Viewport3DContainerComponent: React.FC<Viewport3DContainerProps> = ({
   layers,
   activeRockets,
   simTimeSec,
@@ -96,8 +106,7 @@ export const Viewport3DContainer: React.FC<Viewport3DContainerProps> = ({
   focusedObjectId,
 }) => {
   const containerRef = useRef<HTMLDivElement>(null);
-
-  // ─── Live prop mirrors ────────────────────────────────────────────
+  const [isSpectatingRocket, setIsSpectatingRocket] = useState(false);
   // Read inside the render loop instead of the props themselves.
   const simTimeRef = useRef(simTimeSec);
   const activeRocketsRef = useRef(activeRockets);
@@ -129,6 +138,25 @@ export const Viewport3DContainer: React.FC<Viewport3DContainerProps> = ({
   const zodiacalDustRef = useRef<ZodiacalDustRenderer | null>(null);
   const artificialRendererRef = useRef<ArtificialObjectRenderer | null>(null);
   const spacecraftRendererRef = useRef<SpacecraftRenderer | null>(null);
+  const missionTargetRendererRef = useRef<MissionTargetRenderer | null>(null);
+
+  /** Camera-only mode: the spacecraft remains independent of every body. */
+  const enterRocketSpectator = useCallback(() => {
+    const craft = spacecraftRendererRef.current;
+    const controller = cameraControllerRef.current;
+    if (!craft || !controller) return;
+    // The rocket model radius is 0.02 scene units; a 0.5-unit spectator
+    // distance makes its existing elongated geometry inspectable without
+    // increasing its solar-system world size.
+    controller.focusOnPosition(craft.group.position, 0.5, 0.8);
+    controller.setFollowTarget(craft.group);
+    setIsSpectatingRocket(true);
+  }, []);
+
+  const exitRocketSpectator = useCallback(() => {
+    cameraControllerRef.current?.setFollowTarget(null);
+    setIsSpectatingRocket(false);
+  }, []);
 
   const orbitalOverlayRef = useRef<OrbitalOverlayRenderer | null>(null);
   const dynamicsOverlayRef = useRef<DynamicsOverlayRenderer | null>(null);
@@ -252,6 +280,12 @@ export const Viewport3DContainer: React.FC<Viewport3DContainerProps> = ({
     sm.add(spacecraft.group);
     sm.add(spacecraft.trajectoryLine);
 
+    // Mission-only target representation. It never replaces or reparents the
+    // normal destination planet.
+    const missionTarget = new MissionTargetRenderer();
+    missionTargetRendererRef.current = missionTarget;
+    sm.add(missionTarget.group);
+
     // ── 8. Scientific overlays ─────────────────────────────────────
     const orbOverlay = new OrbitalOverlayRenderer();
     orbitalOverlayRef.current = orbOverlay;
@@ -285,6 +319,36 @@ export const Viewport3DContainer: React.FC<Viewport3DContainerProps> = ({
     // changes, not every frame.
     let lastRocketId: string | null = null;
     const warnedUnknownFrames = new Set<string>();
+    const debuggedLaunches = new Set<string>();
+    const debuggedArrivals = new Set<string>();
+    const debuggedTruthTables = new Set<string>();
+    const raycaster = new THREE.Raycaster();
+    const pointer = new THREE.Vector2();
+    let pointerDown: { x: number; y: number } | null = null;
+
+    const onPointerDown = (event: PointerEvent) => {
+      if (event.button === 0) pointerDown = { x: event.clientX, y: event.clientY };
+    };
+    const onClick = (event: MouseEvent) => {
+      const start = pointerDown;
+      pointerDown = null;
+      // Camera drags do not select the rocket.
+      if (!start || Math.hypot(event.clientX - start.x, event.clientY - start.y) > 4) return;
+
+      const craft = spacecraftRendererRef.current;
+      if (!craft || !craft.group.visible) return;
+      const rect = sm.renderer.domElement.getBoundingClientRect();
+      pointer.set(
+        ((event.clientX - rect.left) / rect.width) * 2 - 1,
+        -((event.clientY - rect.top) / rect.height) * 2 + 1
+      );
+      raycaster.setFromCamera(pointer, sm.camera);
+      if (raycaster.intersectObject(craft.vehicleMesh, true).length > 0) {
+        enterRocketSpectator();
+      }
+    };
+    sm.renderer.domElement.addEventListener('pointerdown', onPointerDown);
+    sm.renderer.domElement.addEventListener('click', onClick);
 
     sm.onRender((dt, elapsed) => {
       // Live values — never the captured props.
@@ -292,26 +356,21 @@ export const Viewport3DContainer: React.FC<Viewport3DContainerProps> = ({
       const rockets = activeRocketsRef.current;
 
       cc.update(dt);
-
-      // Anchor the sky to the observer. Must run after the camera update and
-      // before the draw, so the field is centred on this frame's camera
-      // position rather than the previous one.
       starfield.update(sm.camera);
-
       sun.update(elapsed);
-
       const viewportHeight = containerRef.current?.clientHeight ?? 800;
       viewContext.viewportHeightPx = viewportHeight;
 
       bodyPositions.clear();
       bodyPositions.set('sun', sunWorldPos);
 
-      // Planets: position on their own prepared orbit, then illuminate from
-      // the actual Sun-to-body geometry.
+      // Planets remain exclusively owned by their renderer and its prepared
+      // 3D catalog orbit. Mission code never substitutes a body transform.
       planetRenderersRef.current.forEach((pRenderer, id) => {
         const worldPos = pRenderer.positionAtTime(simTime);
         pRenderer.update(simTime, sunWorldPos);
-        bodyPositions.set(id, worldPos);
+        // Mission frame placement receives a value, never a mutable body transform.
+        bodyPositions.set(id, worldPos.clone());
 
         const lodState = lod.evaluateObject(pRenderer.objectData, worldPos, viewportHeight);
         pRenderer.setLOD(lodState.level);
@@ -321,7 +380,7 @@ export const Viewport3DContainer: React.FC<Viewport3DContainerProps> = ({
           if (!mRenderer) return;
           mRenderer.updateOrbitPosition(simTime, worldPos, sunWorldPos);
           mRenderer.setLOD(lodState.level);
-          bodyPositions.set(m.id, mRenderer.planetRenderer.group.position);
+          bodyPositions.set(m.id, mRenderer.planetRenderer.group.position.clone());
         });
       });
 
@@ -355,8 +414,14 @@ export const Viewport3DContainer: React.FC<Viewport3DContainerProps> = ({
       // is authoritative; the layers effect below sets the same flags so the
       // state is right before the first frame runs.
       const hasMission = !!activeRocket;
-      if (craft) craft.setVisible(hasMission && layersRef.current.missionSpacecraft);
-      orbOverlay.setVisible(hasMission && layersRef.current.orbits);
+      if (craft) {
+        craft.setSpacecraftVisible(hasMission && layersRef.current.missionSpacecraft);
+        craft.setTrajectoryVisible(hasMission && layersRef.current.trajectories);
+      }
+      // Planetary orbit visibility must not make a velocity-arrow telemetry
+      // object look like a second spacecraft. The actual rocket is the only
+      // mission object displayed by default.
+      orbOverlay.setVisible(false);
       dynOverlay.setVisible(hasMission && layersRef.current.forceVectors);
       missOverlay.setVisible(hasMission && layersRef.current.trajectories);
 
@@ -377,24 +442,123 @@ export const Viewport3DContainer: React.FC<Viewport3DContainerProps> = ({
 
         const origin = frameOrigin ?? sunWorldPos;
         craft.setFrameOrigin(origin);
+        missionTarget.setFrameOrigin(origin);
         orbOverlay.group.position.copy(origin);
         dynOverlay.group.position.copy(origin);
 
-        // Per-mission setup: trail geometry and catalogued vehicle size.
-        if (activeRocket.id !== lastRocketId) {
-          lastRocketId = activeRocket.id;
+        // Per-mission setup: rebuild the authoritative trajectory once per mission state change.
+        const history = activeRocket.result?.state_history;
+        const missionKey = `${activeRocket.id}_${activeRocket.result?.mission_id}_${history?.length || 0}`;
+        if (history && history.length > 0 && missionKey !== lastRocketId) {
+          lastRocketId = missionKey;
+          craft.updateTrajectoryHistory(history);
+        }
 
-          const preset = ROCKET_PRESETS.find(r => r.id === activeRocket.presetId);
-          craft.setPhysicalRadiusMeters(
-            spacecraftCharacteristicRadiusM(preset?.cross_section_area_m2)
-          );
+        // One compact, development-only numerical truth table. All values
+        // are sampled from the received ORBIT-X result and the normal Mars
+        // orbit renderer's prepared 3D orbit; no renderer state is mutated.
+        if (import.meta.env.DEV && !debuggedTruthTables.has(activeRocket.id)) {
+          debuggedTruthTables.add(activeRocket.id);
+          const destinationId = activeRocket.destination.toLowerCase();
+          const destinationRenderer = planetRenderersRef.current.get(destinationId);
+          if (history?.length && destinationRenderer?.preparedOrbit) {
+            const finalTime = history[history.length - 1].time_seconds;
+            const rows = [0, 0.25, 0.5, 0.75, 1].map(fraction => {
+              const timeSeconds = finalTime * fraction;
+              const trajectory = getRocketStateAtTime(activeRocket, timeSeconds)!;
+              const destination = getMissionBodyStateAtTime(
+                activeRocket.result?.bodies, destinationId, timeSeconds
+              );
+              const trajectoryWorld = engineToThreePos(trajectory.position).add(origin);
+              // This is the exact point stored in the mission line buffer
+              // (local converted state + line object's frame origin).
+              const trajectoryLinePoint = trajectoryWorld.clone();
+              const normalPlanetWorld = orbitPosition(destinationRenderer.preparedOrbit!, timeSeconds);
+              const destinationWorld = destination
+                ? engineToThreePos(destination.position).add(origin)
+                : null;
+              return {
+                simulationTimeSec: timeSeconds,
+                trajectoryRaw: trajectory.position,
+                trajectoryThree: trajectoryWorld,
+                missionDestinationRaw: destination?.position,
+                missionDestinationThree: destinationWorld,
+                normalPlanetThree: normalPlanetWorld,
+                normalPlanetDerivedRaw: threeToEnginePos(normalPlanetWorld),
+                deltaMissionTargetThree: destinationWorld
+                  ? trajectoryWorld.clone().sub(destinationWorld) : null,
+                deltaNormalPlanetThree: trajectoryWorld.clone().sub(normalPlanetWorld),
+                rocketExpectedWorld: trajectoryWorld.clone(),
+                renderedTrajectoryPoint: trajectoryLinePoint,
+              };
+            });
+            console.table(rows);
 
-          if (activeRocket.result?.state_history) {
-            craft.updateTrajectoryHistory(activeRocket.result.state_history);
+            // Exhaustive Three.js scene object hierarchy and world-coordinate verification
+            const lineAttr = craft.trajectoryLine.geometry.attributes.position;
+            const vertexCount = lineAttr?.count ?? 0;
+            const lineFirstLocal = vertexCount > 0
+              ? new THREE.Vector3(lineAttr.getX(0), lineAttr.getY(0), lineAttr.getZ(0))
+              : new THREE.Vector3();
+            const lineLastLocal = vertexCount > 0
+              ? new THREE.Vector3(lineAttr.getX(vertexCount - 1), lineAttr.getY(vertexCount - 1), lineAttr.getZ(vertexCount - 1))
+              : new THREE.Vector3();
+
+            craft.trajectoryLine.updateMatrixWorld(true);
+            const lineFirstWorld = lineFirstLocal.clone().applyMatrix4(craft.trajectoryLine.matrixWorld);
+            const lineLastWorld = lineLastLocal.clone().applyMatrix4(craft.trajectoryLine.matrixWorld);
+
+            missionTarget.group.updateMatrixWorld(true);
+            const targetWorld = missionTarget.group.getWorldPosition(new THREE.Vector3());
+            const marsTerminalWorld = destinationRenderer.positionAtTime(finalTime);
+            const rocketTerminalWorld = engineToThreePos(history[history.length - 1].position).add(origin);
+
+            const distTrajectoryToTarget = lineLastWorld.distanceTo(targetWorld);
+            const distTrajectoryToMars = lineLastWorld.distanceTo(marsTerminalWorld);
+            const distRocketToTrajectory = rocketTerminalWorld.distanceTo(lineLastWorld);
+
+            console.info('[THESEUS Trajectory World-Space Verification]', {
+              vertexCount,
+              trajectoryFirstVertexLocal: lineFirstLocal.toArray(),
+              trajectoryLastVertexLocal: lineLastLocal.toArray(),
+              trajectoryLineParent: craft.trajectoryLine.parent?.name || 'Scene',
+              trajectoryLinePosition: craft.trajectoryLine.position.toArray(),
+              trajectoryLineRotation: [craft.trajectoryLine.rotation.x, craft.trajectoryLine.rotation.y, craft.trajectoryLine.rotation.z],
+              trajectoryLineScale: craft.trajectoryLine.scale.toArray(),
+              trajectoryLineMatrixWorld: craft.trajectoryLine.matrixWorld.elements,
+              trajectoryFirstWorld: lineFirstWorld.toArray(),
+              trajectoryFinalWorld: lineLastWorld.toArray(),
+              missionTargetWorld: targetWorld.toArray(),
+              marsTerminalWorld: marsTerminalWorld.toArray(),
+              rocketTerminalWorld: rocketTerminalWorld.toArray(),
+              'dist(trajectoryFinalWorld, targetWorld)': distTrajectoryToTarget,
+              'dist(trajectoryFinalWorld, marsTerminalWorld)': distTrajectoryToMars,
+              'dist(rocketTerminalWorld, trajectoryFinalWorld)': distRocketToTrajectory,
+            });
+
+            console.info('[THESEUS mission truth table]', {
+              missionEpochJd: activeRocket.result?.spacecraft?.[0]?.epoch_jd,
+              finalAvailableTimeSec: finalTime,
+              missionFrame: 'ORBIT-X SI ecliptic → THESEUS (x, z, -y), declared central-body origin',
+              destination: activeRocket.destination,
+            });
           }
         }
 
         const st = getRocketStateAtTime(activeRocket, simTime);
+        const terminalState = activeRocket.result?.state_history?.at(-1);
+        const terminalTimeSec = terminalState?.time_seconds || 0;
+        const arrivalTargetState = getMissionBodyStateAtTime(
+          activeRocket.result?.bodies,
+          activeRocket.destination,
+          terminalTimeSec
+        );
+        if (arrivalTargetState) {
+          missionTarget.update(arrivalTargetState.position);
+        } else if (terminalState) {
+          missionTarget.update(terminalState.position);
+        }
+        missionTarget.updateVisualScale(viewContext);
         if (st) {
           // Raw engine state, unmodified. The frame origin above places it.
           craft.updateFrame(st);
@@ -402,6 +566,42 @@ export const Viewport3DContainer: React.FC<Viewport3DContainerProps> = ({
 
           orbOverlay.update(st, activeRocket.result?.state_history);
           dynOverlay.update(st);
+
+          // Development-only frame audit. It compares all three converted
+          // components and never writes to either body or rocket transforms.
+          const terminal = activeRocket.result?.state_history?.at(-1);
+          const isArrival = !!terminal && simTime >= terminal.time_seconds;
+          const shouldLog = import.meta.env.DEV && (
+            (!debuggedLaunches.has(activeRocket.id) && simTime <= st.time_seconds) ||
+            (isArrival && !debuggedArrivals.has(activeRocket.id))
+          );
+          if (shouldLog) {
+            if (isArrival) debuggedArrivals.add(activeRocket.id);
+            else debuggedLaunches.add(activeRocket.id);
+
+            const targetId = activeRocket.destination.toLowerCase();
+            const targetRaw = getMissionBodyStateAtTime(activeRocket.result?.bodies, targetId, st.time_seconds);
+            const trajectoryWorld = engineToThreePos(st.position).add(origin);
+            const targetWorld = targetRaw ? engineToThreePos(targetRaw.position) : null;
+            const delta = targetWorld ? trajectoryWorld.clone().sub(targetWorld) : null;
+            console.info('[THESEUS mission-frame audit]', {
+              origin: activeRocket.origin,
+              destination: activeRocket.destination,
+              missionEpochJd: activeRocket.result?.spacecraft?.[0]?.epoch_jd,
+              simulationTimeSec: st.time_seconds,
+              trajectoryRaw: st.position,
+              trajectoryWorld,
+              destinationRaw: targetRaw?.position,
+              destinationWorld: targetWorld,
+              renderedDestinationWorld: planetRenderersRef.current.get(targetId)?.group.position.clone(),
+              deltaWorld: delta,
+              distanceWorld: delta?.length(),
+              rocketWorld: craft.group.getWorldPosition(new THREE.Vector3()),
+              rocketScale: craft.scaleGroup.scale.clone(),
+              rocketVisible: craft.group.visible && craft.vehicleMesh.visible,
+              rocketParent: craft.group.parent?.name,
+            });
+          }
         }
       }
 
@@ -414,6 +614,8 @@ export const Viewport3DContainer: React.FC<Viewport3DContainerProps> = ({
     sm.start();
 
     return () => {
+      sm.renderer.domElement.removeEventListener('pointerdown', onPointerDown);
+      sm.renderer.domElement.removeEventListener('click', onClick);
       planetRenderersRef.current.forEach(r => r.dispose());
       moonRenderersRef.current.forEach(r => r.dispose());
       planetRenderersRef.current.clear();
@@ -434,10 +636,11 @@ export const Viewport3DContainer: React.FC<Viewport3DContainerProps> = ({
       zodiacalDust.dispose();
       artificialRenderer.dispose();
       spacecraft.dispose();
+      missionTarget.dispose();
       sm.dispose();
       cc.dispose();
     };
-  }, []);
+  }, [enterRocketSpectator]);
 
   // ─── Layer visibility ─────────────────────────────────────────────
   // Every toggle here drives a renderer. Toggles with no renderer behind them
@@ -486,11 +689,17 @@ export const Viewport3DContainer: React.FC<Viewport3DContainerProps> = ({
         layers.satellites || layers.stations || layers.telescopes || layers.probes
       );
     }
-    if (spacecraftRendererRef.current) spacecraftRendererRef.current.setVisible(layers.missionSpacecraft);
+    if (spacecraftRendererRef.current) {
+      spacecraftRendererRef.current.setSpacecraftVisible(layers.missionSpacecraft);
+      spacecraftRendererRef.current.setTrajectoryVisible(activeRockets.length > 0 && layers.trajectories);
+    }
+    if (missionTargetRendererRef.current) {
+      missionTargetRendererRef.current.setVisible(activeRockets.length > 0 && layers.trajectories);
+    }
     // Mission-scoped overlays: these have origin-anchored geometry and are
     // meaningless without a mission. See the render loop for the full note.
     const hasMission = activeRockets.length > 0;
-    if (orbitalOverlayRef.current) orbitalOverlayRef.current.setVisible(hasMission && layers.orbits);
+    if (orbitalOverlayRef.current) orbitalOverlayRef.current.setVisible(false);
     if (dynamicsOverlayRef.current) dynamicsOverlayRef.current.setVisible(hasMission && layers.forceVectors);
     if (missionOverlayRef.current) missionOverlayRef.current.setVisible(hasMission && layers.trajectories);
     if (referenceOverlayRef.current) referenceOverlayRef.current.setVisible(layers.referencePlanes);
@@ -537,9 +746,22 @@ export const Viewport3DContainer: React.FC<Viewport3DContainerProps> = ({
   }, [focusedObjectId]);
 
   return (
-    <div
-      ref={containerRef}
-      className="w-full h-full cursor-grab active:cursor-grabbing bg-[#000000]"
-    />
+    <div className="relative w-full h-full">
+      <div
+        ref={containerRef}
+        className="w-full h-full cursor-grab active:cursor-grabbing bg-[#000000]"
+      />
+      <button
+        type="button"
+        onClick={isSpectatingRocket ? exitRocketSpectator : enterRocketSpectator}
+        disabled={activeRockets.length === 0}
+        className="absolute right-4 top-4 border border-cyan-400/70 bg-black/75 px-3 py-2 font-mono text-xs tracking-wider text-cyan-200 transition-colors hover:bg-cyan-950 disabled:cursor-not-allowed disabled:opacity-40"
+      >
+        {isSpectatingRocket ? 'EXIT SPECTATOR' : 'FOLLOW ROCKET'}
+      </button>
+    </div>
   );
 };
+
+export const Viewport3DContainer = React.memo(Viewport3DContainerComponent);
+

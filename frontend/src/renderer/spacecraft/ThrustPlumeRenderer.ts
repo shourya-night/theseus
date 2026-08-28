@@ -20,7 +20,7 @@ export class ThrustPlumeRenderer {
     this.group.name = 'ThrustPlumeGroup';
 
     // ── 1. Inner Hot Core Cone ────────────────────────────────────
-    const coreGeo = new THREE.ConeGeometry(0.35, 2.2, 16);
+    const coreGeo = new THREE.ConeGeometry(0.35, 2.2, 6);
     coreGeo.rotateX(-Math.PI / 2);
     coreGeo.translate(0, 0, -1.1);
 
@@ -35,7 +35,7 @@ export class ThrustPlumeRenderer {
     this.group.add(this.coreMesh);
 
     // ── 2. Outer Expanding Exhaust Cone ───────────────────────────
-    const outerGeo = new THREE.ConeGeometry(0.7, 3.8, 16);
+    const outerGeo = new THREE.ConeGeometry(0.7, 3.8, 6);
     outerGeo.rotateX(-Math.PI / 2);
     outerGeo.translate(0, 0, -1.9);
 

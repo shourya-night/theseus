@@ -123,8 +123,14 @@ export class HildaRenderer {
     this.update(0);
   }
 
+  private lastSimTimeSec = -Infinity;
+
   update(simTimeSec: number): void {
     if (!this.instancedMesh.visible) return;
+    if (this.lastSimTimeSec !== -Infinity && Math.abs(simTimeSec - this.lastSimTimeSec) < 60) {
+      return;
+    }
+    this.lastSimTimeSec = simTimeSec;
 
     for (let i = 0; i < this.count; i++) {
       orbitPositionInto(this.orbits[i], simTimeSec, this.scratch);

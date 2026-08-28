@@ -17,6 +17,11 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 import numpy as np
 
 from theseus.bodies.catalog import ALL_BODIES, get_body, EARTH, SUN
+from theseus.ephemeris.simple_provider import (
+    PLANETARY_ORBITAL_ELEMENTS,
+    SimpleEphemerisProvider,
+)
+from theseus.time.epochs import JD_J2000
 from theseus.constants.physical import G0_VAL
 from theseus.core.state import SimulationState, StateHistory
 from theseus.dynamics.force_model import CompositeForceModel
@@ -49,65 +54,17 @@ from theseus.uncertainty.risk import classify_risk, RiskAssessment, RiskThreshol
 # AU in meters
 AU_METERS = 149597870700.0
 
-# Authoritative Keplerian Elements for Planetary Motion
+# Compatibility view for callers that use the historical public constant.
+# The single authoritative data source is the full-3D ephemeris provider.
 PLANET_KEPLERIAN_DATA: Dict[str, Dict[str, float]] = {
-    "mercury": {
-        "a_m": 0.38709893 * AU_METERS,
-        "e": 0.20563069,
-        "w_rad": math.radians(77.45645),
-        "period_sec": 87.9691 * 86400.0,
-        "m0_rad": math.radians(174.7947),
-    },
-    "venus": {
-        "a_m": 0.72333199 * AU_METERS,
-        "e": 0.00677323,
-        "w_rad": math.radians(131.53298),
-        "period_sec": 224.701 * 86400.0,
-        "m0_rad": math.radians(50.115),
-    },
-    "earth": {
-        "a_m": 1.00000011 * AU_METERS,
-        "e": 0.01671022,
-        "w_rad": math.radians(102.94719),
-        "period_sec": 365.25636 * 86400.0,
-        "m0_rad": math.radians(358.617),
-    },
-    "mars": {
-        "a_m": 1.52366231 * AU_METERS,
-        "e": 0.09341233,
-        "w_rad": math.radians(336.04084),
-        "period_sec": 686.971 * 86400.0,
-        "m0_rad": math.radians(19.373),
-    },
-    "jupiter": {
-        "a_m": 5.20336301 * AU_METERS,
-        "e": 0.04839266,
-        "w_rad": math.radians(14.75385),
-        "period_sec": 4332.59 * 86400.0,
-        "m0_rad": math.radians(20.020),
-    },
-    "saturn": {
-        "a_m": 9.53707032 * AU_METERS,
-        "e": 0.05415060,
-        "w_rad": math.radians(92.43194),
-        "period_sec": 10759.22 * 86400.0,
-        "m0_rad": math.radians(317.020),
-    },
-    "uranus": {
-        "a_m": 19.19126393 * AU_METERS,
-        "e": 0.04716771,
-        "w_rad": math.radians(170.96424),
-        "period_sec": 30685.4 * 86400.0,
-        "m0_rad": math.radians(142.2386),
-    },
-    "neptune": {
-        "a_m": 30.06896348 * AU_METERS,
-        "e": 0.00858587,
-        "w_rad": math.radians(44.97135),
-        "period_sec": 60189.0 * 86400.0,
-        "m0_rad": math.radians(256.228),
-    },
+    name.lower(): {
+        **elements,
+        "period_sec": elements["period_days"] * 86400.0,
+    }
+    for name, elements in PLANETARY_ORBITAL_ELEMENTS.items()
+    if name not in {"Sun", "Moon"}
 }
+_PLANETARY_EPHEMERIS = SimpleEphemerisProvider()
 
 
 def solve_kepler_equation(M_rad: float, e: float) -> float:
@@ -128,41 +85,15 @@ def solve_kepler_equation(M_rad: float, e: float) -> float:
 
 def get_planet_state_at_time(planet_name: str, time_sec: float = 0.0) -> Tuple[np.ndarray, np.ndarray]:
     """
-    Calculate accurate heliocentric position (m) and velocity (m/s) for any planet at elapsed seconds t.
-    Uses real elliptical Keplerian elements with Sun at (0, 0) focus.
+    Return the shared full-3D heliocentric Keplerian state at elapsed seconds
+    from J2000. This delegates to the mission API ephemeris provider rather
+    than maintaining a second planar planetary model.
     """
     key = planet_name.strip().lower()
     if key not in PLANET_KEPLERIAN_DATA:
         # Default Earth orbit if unknown
         key = "earth"
-    
-    elem = PLANET_KEPLERIAN_DATA[key]
-    a = elem["a_m"]
-    e = elem["e"]
-    w = elem["w_rad"]
-    T = elem["period_sec"]
-    m0 = elem["m0_rad"]
-    mu_sun = SUN.mu
-
-    n = (2.0 * math.pi) / T
-    M = m0 + n * time_sec
-    E = solve_kepler_equation(M, e)
-
-    # True anomaly nu
-    nu = 2.0 * math.atan2(math.sqrt(1.0 + e) * math.sin(E / 2.0), math.sqrt(1.0 - e) * math.cos(E / 2.0))
-    r_mag = a * (1.0 - e * math.cos(E))
-
-    theta = nu + w
-    pos = np.array([r_mag * math.cos(theta), r_mag * math.sin(theta), 0.0], dtype=np.float64)
-
-    # Heliocentric orbital velocity components
-    p = a * (1.0 - e * e)
-    h = math.sqrt(mu_sun * p)
-    vx = -(mu_sun / h) * (math.sin(theta) + e * math.sin(w))
-    vy = (mu_sun / h) * (math.cos(theta) + e * math.cos(w))
-    vel = np.array([vx, vy, 0.0], dtype=np.float64)
-
-    return pos, vel
+    return _PLANETARY_EPHEMERIS.get_state(key, JD_J2000 + time_sec / 86400.0)
 
 
 class SolarRadiationPressureUnavailable(NotImplementedError):
