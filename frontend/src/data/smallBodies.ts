@@ -19,19 +19,25 @@ export { AU_KM };
 
 
 // ─── NAMED ASTEROIDS (Main Belt) ────────────────────────────────────
+//
+// Orbital elements sourced from JPL Small-Body Database (SBDB).
+// Reference frame: heliocentric ecliptic J2000. All angular elements in
+// degrees. Period in days.
 
 function asteroid(
   id: string, name: string, radius_km: number, mass_kg: number,
-  a_AU: number, e: number, inc_deg: number, period_days: number,
+  a_AU: number, e: number, inc_deg: number,
+  raan_deg: number, w_deg: number, m0_deg: number,
+  period_days: number,
   color: [number, number, number],
 ): AstronomicalObject {
   return {
     id, name, type: 'ASTEROID', category: 'SMALL_BODY', parent: 'sun',
     dataSource: 'REAL', radius_km, mass_kg,
     orbit: {
-      a_km: a_AU * AU_KM, e, inc_deg, raan_deg: 0, w_deg: 0,
-      m0_deg: deterministicPhaseDeg(id), period_days,
-      elementProvenance: 'PLACEHOLDER',
+      a_km: a_AU * AU_KM, e, inc_deg, raan_deg, w_deg, m0_deg,
+      period_days,
+      elementProvenance: 'CATALOG',
     },
     color,
     surface: { type: 'irregular', baseColor: color, roughness: 0.9, craterDensity: 0.5 },
@@ -40,15 +46,16 @@ function asteroid(
 }
 
 export const NAMED_ASTEROIDS: AstronomicalObject[] = [
-  asteroid('vesta', 'Vesta', 262.7, 2.59e20, 2.3615, 0.0887, 7.14, 1325.75, [0.55, 0.52, 0.48]),
-  asteroid('pallas', 'Pallas', 256, 2.11e20, 2.7716, 0.2313, 34.83, 1686.43, [0.48, 0.46, 0.43]),
-  asteroid('hygiea', 'Hygiea', 217, 8.67e19, 3.1416, 0.1146, 3.84, 2035.04, [0.40, 0.38, 0.36]),
-  asteroid('eros', 'Eros', 8.42, 6.687e15, 1.458, 0.2226, 10.83, 643.0, [0.58, 0.48, 0.38]),
-  asteroid('bennu', 'Bennu', 0.245, 7.329e10, 1.126, 0.2037, 6.035, 436.65, [0.42, 0.38, 0.35]),
-  asteroid('ryugu', 'Ryugu', 0.45, 4.50e11, 1.190, 0.1903, 5.884, 473.89, [0.35, 0.32, 0.30]),
-  asteroid('apophis', 'Apophis', 0.185, 2.7e10, 0.9224, 0.1912, 3.339, 323.59, [0.52, 0.45, 0.38]),
-  asteroid('ida', 'Ida', 15.7, 4.2e16, 2.862, 0.0452, 1.14, 1768.0, [0.50, 0.46, 0.42]),
-  asteroid('gaspra', 'Gaspra', 6.1, 2.5e16, 2.210, 0.1735, 4.10, 1199.0, [0.55, 0.50, 0.45]),
+  //                  id          name       R_km      mass_kg        a_AU    e       i°      Ω°       ω°       M₀°      P_days   color
+  asteroid('vesta',   'Vesta',    262.7,  2.59e20,    2.3615,  0.0887,  7.14,  103.85,  149.83,   20.86,  1325.75,  [0.55, 0.52, 0.48]),
+  asteroid('pallas',  'Pallas',   256,    2.11e20,    2.7716,  0.2313, 34.83,  173.09,  310.15,   78.23,  1686.43,  [0.48, 0.46, 0.43]),
+  asteroid('hygiea',  'Hygiea',   217,    8.67e19,    3.1416,  0.1146,  3.84,  283.83,  312.28,  246.72,  2035.04,  [0.40, 0.38, 0.36]),
+  asteroid('eros',    'Eros',     8.42,   6.687e15,   1.458,   0.2226, 10.83,  304.43,  178.64,  222.47,   643.0,   [0.58, 0.48, 0.38]),
+  asteroid('bennu',   'Bennu',    0.245,  7.329e10,   1.126,   0.2037,  6.035,   2.06,   66.22,  101.70,   436.65,  [0.42, 0.38, 0.35]),
+  asteroid('ryugu',   'Ryugu',    0.45,   4.50e11,    1.190,   0.1903,  5.884, 251.62,  211.44,  127.79,   473.89,  [0.35, 0.32, 0.30]),
+  asteroid('apophis',  'Apophis',  0.185,  2.7e10,     0.9224,  0.1912,  3.339, 204.43,  126.40,  215.54,   323.59,  [0.52, 0.45, 0.38]),
+  asteroid('ida',     'Ida',      15.7,   4.2e16,     2.862,   0.0452,  1.14,  324.02,  108.57,  276.18,  1768.0,   [0.50, 0.46, 0.42]),
+  asteroid('gaspra',  'Gaspra',   6.1,    2.5e16,     2.210,   0.1735,  4.10,  253.16,  129.88,  196.45,  1199.0,   [0.55, 0.50, 0.45]),
 ];
 
 // Mark certain asteroids as NEOs
@@ -74,10 +81,15 @@ if (ryugu) { ryugu.neoClass = 'APOLLO'; }
 
 
 // ─── COMETS ─────────────────────────────────────────────────────────
+//
+// Orbital elements sourced from JPL SBDB. High-eccentricity orbits:
+// Halley, Hale-Bopp, and Hyakutake are retrograde (i > 90°).
 
 function comet(
   id: string, name: string, radius_km: number,
-  a_AU: number, e: number, inc_deg: number, period_days: number,
+  a_AU: number, e: number, inc_deg: number,
+  raan_deg: number, w_deg: number, m0_deg: number,
+  period_days: number,
 ): AstronomicalObject {
   return {
     id, name, type: 'COMET', category: 'SMALL_BODY', parent: 'sun',
@@ -85,11 +97,9 @@ function comet(
     // are deliberately omitted rather than filled with a placeholder value.
     dataSource: 'REFERENCE', radius_km,
     orbit: {
-      // a, e, i and the period are catalog values; Ω, ω and M₀ are not
-      // available in this dataset, so the orbit is oriented for display only.
-      a_km: a_AU * AU_KM, e, inc_deg, raan_deg: 0, w_deg: 0,
-      m0_deg: deterministicPhaseDeg(id), period_days,
-      elementProvenance: 'PLACEHOLDER',
+      a_km: a_AU * AU_KM, e, inc_deg, raan_deg, w_deg, m0_deg,
+      period_days,
+      elementProvenance: 'CATALOG',
     },
     color: [0.72, 0.70, 0.65],
     surface: { type: 'irregular', baseColor: [0.45, 0.42, 0.38], roughness: 0.95 },
@@ -98,11 +108,12 @@ function comet(
 }
 
 export const NAMED_COMETS: AstronomicalObject[] = [
-  comet('halley', "Halley's Comet (1P)", 5.5, 17.834, 0.9671, 162.26, 27507),
-  comet('67p', '67P/Churyumov–Gerasimenko', 2.0, 3.4630, 0.6410, 7.04, 2354),
-  comet('hale-bopp', 'Hale-Bopp (C/1995 O1)', 30, 186.0, 0.9951, 89.43, 927175),
-  comet('hyakutake', 'Hyakutake (C/1996 B2)', 2.0, 1700.0, 0.9998, 124.92, 25583700),
-  comet('encke', 'Encke (2P)', 2.4, 2.2152, 0.8483, 11.78, 1204),
+  //                              id            name                              R_km   a_AU      e        i°       Ω°       ω°       M₀°      P_days
+  comet('halley',     "Halley's Comet (1P)",                  5.5,  17.834,  0.9671,  162.26,   58.42,  111.33,   38.38,  27507),
+  comet('67p',        '67P/Churyumov–Gerasimenko',           2.0,   3.4630,  0.6410,    7.04,   50.15,   12.78,  303.71,   2354),
+  comet('hale-bopp',  'Hale-Bopp (C/1995 O1)',               30,  186.0,    0.9951,   89.43,  282.47,  130.59,    0.11, 927175),
+  comet('hyakutake',  'Hyakutake (C/1996 B2)',                2.0, 1700.0,   0.9998,  124.92,  188.04,  130.17,    0.00, 25583700),
+  comet('encke',      'Encke (2P)',                           2.4,   2.2152,  0.8483,   11.78,  334.57,  186.55,  186.52,   1204),
 ];
 
 

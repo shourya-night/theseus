@@ -33,6 +33,11 @@ import { KuiperBeltRenderer } from '../../renderer/populations/KuiperBeltRendere
 import { ScatteredDiskRenderer } from '../../renderer/populations/ScatteredDiskRenderer';
 import { OortCloudRenderer } from '../../renderer/populations/OortCloudRenderer';
 import { MeteorStreamRenderer } from '../../renderer/populations/MeteorStreamRenderer';
+import { TrojanRenderer } from '../../renderer/populations/TrojanRenderer';
+import { HildaRenderer } from '../../renderer/populations/HildaRenderer';
+import { CybeleRenderer } from '../../renderer/populations/CybeleRenderer';
+import { CentaurRenderer } from '../../renderer/populations/CentaurRenderer';
+import { ZodiacalDustRenderer } from '../../renderer/populations/ZodiacalDustRenderer';
 import { StarfieldRenderer } from '../../renderer/environment/StarfieldRenderer';
 import { SpacecraftRenderer } from '../../renderer/spacecraft/SpacecraftRenderer';
 import { OrbitalOverlayRenderer } from '../../renderer/overlays/OrbitalOverlayRenderer';
@@ -117,6 +122,11 @@ export const Viewport3DContainer: React.FC<Viewport3DContainerProps> = ({
   const scatteredDiskRef = useRef<ScatteredDiskRenderer | null>(null);
   const oortCloudRef = useRef<OortCloudRenderer | null>(null);
   const meteorStreamRef = useRef<MeteorStreamRenderer | null>(null);
+  const trojanRef = useRef<TrojanRenderer | null>(null);
+  const hildaRef = useRef<HildaRenderer | null>(null);
+  const cybeleRef = useRef<CybeleRenderer | null>(null);
+  const centaurRef = useRef<CentaurRenderer | null>(null);
+  const zodiacalDustRef = useRef<ZodiacalDustRenderer | null>(null);
   const artificialRendererRef = useRef<ArtificialObjectRenderer | null>(null);
   const spacecraftRendererRef = useRef<SpacecraftRenderer | null>(null);
 
@@ -201,6 +211,26 @@ export const Viewport3DContainer: React.FC<Viewport3DContainerProps> = ({
     const meteorStreams = new MeteorStreamRenderer();
     meteorStreamRef.current = meteorStreams;
     sm.add(meteorStreams.group);
+
+    const trojans = new TrojanRenderer();
+    trojanRef.current = trojans;
+    sm.add(trojans.group);
+
+    const hildas = new HildaRenderer();
+    hildaRef.current = hildas;
+    sm.add(hildas.instancedMesh);
+
+    const cybeles = new CybeleRenderer();
+    cybeleRef.current = cybeles;
+    sm.add(cybeles.instancedMesh);
+
+    const centaurs = new CentaurRenderer();
+    centaurRef.current = centaurs;
+    sm.add(centaurs.instancedMesh);
+
+    const zodiacalDust = new ZodiacalDustRenderer();
+    zodiacalDustRef.current = zodiacalDust;
+    sm.add(zodiacalDust.points);
 
     // ── 6. Artificial objects ──────────────────────────────────────
     const artificialRenderer = new ArtificialObjectRenderer();
@@ -301,6 +331,10 @@ export const Viewport3DContainer: React.FC<Viewport3DContainerProps> = ({
       kuiperBelt.update(simTime);
       scatteredDisk.update(simTime);
       meteorStreams.update(simTime);
+      trojans.update(simTime);
+      hildas.update(simTime);
+      cybeles.update(simTime);
+      centaurs.update(simTime);
       artificialRenderer.update(simTime, bodyPositions, viewContext);
 
       // Mission spacecraft.
@@ -393,6 +427,11 @@ export const Viewport3DContainer: React.FC<Viewport3DContainerProps> = ({
       scatteredDisk.dispose();
       oortCloud.dispose();
       meteorStreams.dispose();
+      trojans.dispose();
+      hildas.dispose();
+      cybeles.dispose();
+      centaurs.dispose();
+      zodiacalDust.dispose();
       artificialRenderer.dispose();
       spacecraft.dispose();
       sm.dispose();
@@ -433,6 +472,15 @@ export const Viewport3DContainer: React.FC<Viewport3DContainerProps> = ({
     if (scatteredDiskRef.current) scatteredDiskRef.current.setVisible(layers.scatteredDisk);
     if (oortCloudRef.current) oortCloudRef.current.setVisible(layers.oortCloud);
     if (meteorStreamRef.current) meteorStreamRef.current.setVisible(layers.meteorStreams);
+    if (trojanRef.current) {
+      trojanRef.current.setVisible(layers.trojansL4 || layers.trojansL5);
+      trojanRef.current.setL4Visible(layers.trojansL4);
+      trojanRef.current.setL5Visible(layers.trojansL5);
+    }
+    if (hildaRef.current) hildaRef.current.setVisible(layers.hildas);
+    if (cybeleRef.current) cybeleRef.current.setVisible(layers.cybeles);
+    if (centaurRef.current) centaurRef.current.setVisible(layers.centaurs);
+    if (zodiacalDustRef.current) zodiacalDustRef.current.setVisible(layers.zodiacalDust);
     if (artificialRendererRef.current) {
       artificialRendererRef.current.setVisible(
         layers.satellites || layers.stations || layers.telescopes || layers.probes
