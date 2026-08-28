@@ -8,6 +8,11 @@ import { ConjunctionsPanel } from "./components/Analysis/ConjunctionsPanel";
 import { BPlaneRiskOverlay } from "./components/Analysis/BPlaneRiskOverlay";
 import { ErrorBoundary } from "./components/Common/ErrorBoundary";
 
+import { SimulatorLayout } from "./components/Layout/SimulatorLayout";
+import { Viewport3DContainer } from "./components/Simulation/Viewport3DContainer";
+import { MissionBuildOverlay } from "./components/Mission/MissionBuildOverlay";
+import { LayerState, DEFAULT_LAYER_STATE } from "./components/Visualization/VisualizationLayersPanel";
+
 import { 
   SimulationResult, 
   MultiSimulationResult, 
@@ -19,7 +24,7 @@ import {
   ActiveRocket,
   ActiveExplosion
 } from "./types/mission";
-import { getRocketStateAtTime } from "./lib/simulationClock";
+import { getRocketStateAtTime, hasFlyingRockets, getRocketLifecycleState } from "./lib/simulationClock";
 import { CELESTIAL_BODIES } from "./data/celestialCatalog";
 import { ROCKET_PRESETS } from "./data/rocketPresets";
 import { 
@@ -68,8 +73,17 @@ export function App() {
   const [isSetupOpen, setIsSetupOpen] = useState<boolean>(false);
   const [isMultiSetupOpen, setIsMultiSetupOpen] = useState<boolean>(false);
   const [isCalculationsOpen, setIsCalculationsOpen] = useState<boolean>(false);
+  const [isBuildOverlayOpen, setIsBuildOverlayOpen] = useState<boolean>(false);
   const [selectedConjunction, setSelectedConjunction] = useState<MultiConjunctionEvent | null>(null);
   const [showConjunctionsSidebar, setShowConjunctionsSidebar] = useState<boolean>(true);
+
+  // Visualization Layers & Focus State
+  const [layers, setLayers] = useState<LayerState>(DEFAULT_LAYER_STATE);
+  const [focusedObjectId, setFocusedObjectId] = useState<string | null>(null);
+
+  const handleToggleLayer = (key: keyof LayerState) => {
+    setLayers((prev) => ({ ...prev, [key]: !prev[key] }));
+  };
 
   // Active Simulation Mode: Default to 'SINGLE' (Phase 1-7 Core Mission)
   const [simMode, setSimMode] = useState<"MULTI" | "SINGLE">("SINGLE");
@@ -142,8 +156,8 @@ export function App() {
   const [simResult, setSimResult] = useState<SimulationResult | null>(null);
   const [selectedObjectId, setSelectedObjectId] = useState<string | null>("SC-01");
 
-  // Playback State
-  const [currentFrameIdx, setCurrentFrameIdx] = useState<number>(0);
+  // Master Physical Simulation Clock State (Authoritative time in SI seconds)
+  const [simTimeSec, setSimTimeSec] = useState<number>(0);
   const [isPlaying, setIsPlaying] = useState<boolean>(false);
   const [playbackSpeed, setPlaybackSpeed] = useState<number>(1);
 
@@ -186,30 +200,44 @@ export function App() {
     return () => window.removeEventListener("keydown", handleKeyDown);
   }, []);
 
-  // Animation Frame Scrubber Loop
+  // Master Physical Simulation Clock Loop (Advances simTimeSec directly)
   useEffect(() => {
-    let totalFrames = 0;
-    if (simMode === "MULTI" && multiSimResult && multiSimResult.objects.length > 0) {
-      totalFrames = multiSimResult.objects[0].state_history.length;
-    } else if (simResult && simResult.state_history) {
-      totalFrames = simResult.state_history.length;
+    if (!isPlaying) return;
+
+    let totalDurationSec = 7200;
+    if (activeRockets.length > 0) {
+      totalDurationSec = Math.max(...activeRockets.map((r) => r.result?.state_history ? r.result.state_history[r.result.state_history.length - 1]?.time_seconds || 0 : 0));
+    } else if (simMode === "MULTI" && multiSimResult?.objects?.length) {
+      totalDurationSec = multiSimResult.objects[0].state_history[multiSimResult.objects[0].state_history.length - 1]?.time_seconds || 7200;
+    } else if (simResult?.state_history?.length) {
+      totalDurationSec = simResult.state_history[simResult.state_history.length - 1]?.time_seconds || 864000;
     }
 
-    if (!isPlaying || totalFrames === 0) return;
+    const dtSimSec = Math.max(3600, Math.round((totalDurationSec / 200) * playbackSpeed));
+    const intervalMs = 30; // ~33 FPS smooth tick
 
-    const intervalMs = Math.max(20, Math.floor(60 / playbackSpeed));
     const timer = setInterval(() => {
-      setCurrentFrameIdx((prev) => {
-        if (prev >= totalFrames - 1) {
+      setSimTimeSec((prev) => {
+        const nextTime = prev + dtSimSec;
+
+        // Check if multi-rocket fleet has any FLYING rockets
+        if (activeRockets.length > 0 && !hasFlyingRockets(activeRockets, nextTime)) {
+          console.log(`[SIMULATION COMPLETE] Time: ${(nextTime / 86400).toFixed(1)} days | Flying rockets: 0`);
           setIsPlaying(false);
-          return totalFrames - 1;
+          return nextTime;
         }
-        return prev + 1;
+
+        if (activeRockets.length === 0 && nextTime >= totalDurationSec) {
+          setIsPlaying(false);
+          return totalDurationSec;
+        }
+
+        return nextTime;
       });
     }, intervalMs);
 
     return () => clearInterval(timer);
-  }, [isPlaying, playbackSpeed, simMode, multiSimResult, simResult]);
+  }, [isPlaying, playbackSpeed, activeRockets, simMode, multiSimResult, simResult]);
 
   // Execute Multi-Spacecraft Environment Simulation
   const handleRunMultiSimulation = async (spacecraftToRun: SpacecraftConfig[] = fleetList) => {
@@ -234,7 +262,7 @@ export function App() {
 
       setMultiSimResult(res);
       setSelectedObjectId(res.objects[0].id);
-      setCurrentFrameIdx(0);
+      setSimTimeSec(0);
       setIsPlaying(true);
     } catch (err: any) {
       console.error("Multi-simulation error:", err);
@@ -368,8 +396,9 @@ export function App() {
       };
 
       setActiveRockets((prev) => [...prev, newRocket]);
-      setCurrentFrameIdx(0);
-      setIsPlaying(true);
+      setSimTimeSec(0);
+      setIsPlaying(false);
+      setIsBuildOverlayOpen(true);
     } catch (err: any) {
       console.error("Simulation error:", err);
       setSimulationError(err?.message || "Failed to solve mission trajectory.");
@@ -378,31 +407,31 @@ export function App() {
     }
   };
 
-  // Derive active time and state telemetry
-  let currentTimeSec = 0;
+  // Derive telemetry and UI scrubber variables
   let totalDurationSec = 7200;
-  let totalFrames = 0;
+  let totalFrames = 200;
+  let currentTimeSec = simTimeSec;
   let activeSelectedTrack: SpacecraftTrack | null = null;
 
-  if (activeRockets.length > 0 && activeRockets[0].result?.state_history?.length > 0) {
-    totalFrames = activeRockets[0].result.state_history.length;
-    const clampedIdx = Math.min(currentFrameIdx, totalFrames - 1);
-    currentTimeSec = activeRockets[0].result.state_history[clampedIdx]?.time_seconds || 0;
+  if (activeRockets.length > 0) {
     totalDurationSec = Math.max(...activeRockets.map((r) => r.result?.state_history ? r.result.state_history[r.result.state_history.length - 1]?.time_seconds || 0 : 0));
+    totalFrames = Math.max(200, Math.round((totalDurationSec / 86400) * 2));
   } else if (simMode === "MULTI" && multiSimResult && multiSimResult.objects.length > 0) {
     totalFrames = multiSimResult.objects[0].state_history.length;
-    const clampedIdx = Math.min(currentFrameIdx, totalFrames - 1);
-    currentTimeSec = multiSimResult.objects[0].state_history[clampedIdx]?.time_seconds || 0;
     totalDurationSec = multiSimResult.objects[0].state_history[totalFrames - 1]?.time_seconds || 7200;
     activeSelectedTrack = multiSimResult.objects.find((o) => o.id === selectedObjectId) || multiSimResult.objects[0];
   } else if (simResult && simResult.state_history && simResult.state_history.length > 0) {
     totalFrames = simResult.state_history.length;
-    const clampedIdx = Math.min(currentFrameIdx, totalFrames - 1);
-    currentTimeSec = simResult.state_history[clampedIdx]?.time_seconds || 0;
     totalDurationSec = simResult.state_history[totalFrames - 1]?.time_seconds || 0;
   }
 
-  // Pairwise Collision & Sun Hazard Monitor Loop (Evaluates positions using universal simulation clock currentTimeSec)
+  // Derive currentFrameIdx for UI timeline scrubber
+  const currentFrameIdx = Math.min(
+    totalFrames - 1,
+    Math.max(0, Math.round((simTimeSec / Math.max(1, totalDurationSec)) * (totalFrames - 1)))
+  );
+
+  // Strict Fleet Lifecycle & Pairwise Collision Monitor Loop (Evaluates positions and fleet status at currentTimeSec)
   useEffect(() => {
     if (activeRockets.length === 0) return;
 
@@ -413,6 +442,7 @@ export function App() {
       // 1. Sun Collision Check (|R_rocket(t)| < 2.0e9 m)
       const distSun = Math.hypot(stA.position[0], stA.position[1], stA.position[2]);
       if (distSun < 2.0e9 && rA.collisionState !== "DESTROYED_BY_SUN") {
+        console.log(`[ROCKET LIFECYCLE] ${rA.name} (${rA.id}): FLYING → DESTROYED_BY_SUN at T = ${(currentTimeSec / 86400).toFixed(1)} days`);
         setActiveRockets((prev) =>
           prev.map((r) => (r.id === rA.id ? { ...r, collisionState: "DESTROYED_BY_SUN" } : r))
         );
@@ -441,6 +471,7 @@ export function App() {
       const COLLISION_RADIUS_M = 5e7;
 
       if (distM <= COLLISION_RADIUS_M) {
+        console.log(`[ROCKET LIFECYCLE] ${rA.name} & ${rB.name}: FLYING → COLLIDED at T = ${(currentTimeSec / 86400).toFixed(1)} days`);
         console.log(`[INTERCEPT PLAYBACK] Sim Time: ${currentTimeSec.toFixed(1)}s | Target Pos: [${stB.position.map(n => n.toFixed(0)).join(", ")}] | Interceptor Pos: [${stA.position.map(n => n.toFixed(0)).join(", ")}] | Runtime Separation: ${distM.toFixed(0)} m`);
 
         // Mark collision state exactly once
@@ -468,24 +499,18 @@ export function App() {
         setActiveExplosions((prev) => [...prev, newExplosion]);
       }
     });
-  }, [currentTimeSec, activeRockets]);
+
+    // Check Authoritative Fleet Lifecycle Rule: Stop simulation ONLY when NO rockets are FLYING
+    if (isPlaying && activeRockets.length > 0 && !hasFlyingRockets(activeRockets, currentTimeSec)) {
+      console.log(`[SIMULATION COMPLETE] Time: ${(currentTimeSec / 86400).toFixed(1)} days | Flying rockets: 0`);
+      setIsPlaying(false);
+    }
+  }, [currentTimeSec, activeRockets, isPlaying]);
 
   // Jump to specific time (e.g. TCA)
   const handleJumpToTime = (targetTimeSec: number) => {
-    if (simMode === "MULTI" && multiSimResult && multiSimResult.objects.length > 0) {
-      const times = multiSimResult.objects[0].state_history.map((s) => s.time_seconds);
-      let closestIdx = 0;
-      let minDiff = Infinity;
-      times.forEach((t, idx) => {
-        const diff = Math.abs(t - targetTimeSec);
-        if (diff < minDiff) {
-          minDiff = diff;
-          closestIdx = idx;
-        }
-      });
-      setCurrentFrameIdx(closestIdx);
-      setIsPlaying(false);
-    }
+    setSimTimeSec(targetTimeSec);
+    setIsPlaying(false);
   };
 
   const origBody = CELESTIAL_BODIES[origin.toLowerCase()] || CELESTIAL_BODIES["earth"];
@@ -493,24 +518,68 @@ export function App() {
 
   return (
     <ErrorBoundary>
-      <div className="w-screen h-screen flex flex-col bg-black text-neutral-100 font-mono select-none overflow-hidden relative">
-        
-        {/* Modals */}
-        <MultiSpacecraftSetupModal
-          isOpen={isMultiSetupOpen}
-          onClose={() => setIsMultiSetupOpen(false)}
-          spacecraftList={fleetList}
-          onUpdateSpacecraftList={setFleetList}
-          onLaunchAll={(list) => {
-            setFleetList(list);
-            handleRunMultiSimulation(list);
-          }}
-          isLoading={isLoading}
+      <div className="w-full h-full relative overflow-hidden bg-black">
+        <SimulatorLayout
+          onOpenMissionSetup={() => setIsSetupOpen(true)}
+          onOpenAnalysisOverlay={() => setIsCalculationsOpen(true)}
+          activeRockets={activeRockets}
+          selectedObjectId={selectedObjectId}
+          onSelectObjectId={setSelectedObjectId}
+          onFocusObjectId={setFocusedObjectId}
+          simTimeSec={simTimeSec}
+          maxSimTimeSec={totalDurationSec}
+          isPlaying={isPlaying}
+          onTogglePlay={() => setIsPlaying(!isPlaying)}
+          onSeekTime={(t) => setSimTimeSec(t)}
+          simSpeed={playbackSpeed}
+          onChangeSimSpeed={(s) => setPlaybackSpeed(s)}
+          layers={layers}
+          onToggleLayer={handleToggleLayer}
+          viewportContent={
+            <Viewport3DContainer
+              layers={layers}
+              activeRockets={activeRockets}
+              simTimeSec={simTimeSec}
+              selectedObjectId={selectedObjectId}
+              focusedObjectId={focusedObjectId}
+            />
+          }
         />
 
+        {/* ORBIT-X Mission Construction Animation Overlay */}
+        <MissionBuildOverlay
+          isOpen={isBuildOverlayOpen}
+          onClose={() => setIsBuildOverlayOpen(false)}
+          simResult={simResult}
+          originName={origin}
+          destinationName={destination}
+          vehicleName={selectedPreset.name}
+          onComplete={() => {
+            setSimTimeSec(0);
+            setIsPlaying(true);
+          }}
+        />
+
+        {/* Calculation Analysis Overlay */}
+        <CalculationAnalysisOverlay
+          isOpen={isCalculationsOpen}
+          onClose={() => setIsCalculationsOpen(false)}
+          simResult={simResult}
+          originName={origin}
+          destinationName={destination}
+          vehicleName={selectedPreset.name}
+          payloadKg={payloadKg}
+          epochDate={epochDate}
+        />
+
+        {/* Single Mission Setup Modal */}
         <MissionSetupModal
           isOpen={isSetupOpen}
           onClose={() => setIsSetupOpen(false)}
+          currentOrigin={origin}
+          currentDestination={destination}
+          currentPresetId={selectedPresetId}
+          currentPayloadKg={payloadKg}
           onInitializeMission={(config) => {
             setOrigin(config.origin);
             setDestination(config.destination);
@@ -526,391 +595,26 @@ export function App() {
               config.collisionTargetId
             );
           }}
-          currentOrigin={origin}
-          currentDestination={destination}
-          currentPresetId={selectedPresetId}
-          currentPayloadKg={payloadKg}
           activeRockets={activeRockets}
         />
 
-        <BPlaneRiskOverlay
-          conjunction={selectedConjunction}
-          onClose={() => setSelectedConjunction(null)}
+        {/* Multi-Spacecraft Setup Modal */}
+        <MultiSpacecraftSetupModal
+          isOpen={isMultiSetupOpen}
+          onClose={() => setIsMultiSetupOpen(false)}
+          spacecraftList={fleetList}
+          onUpdateSpacecraftList={setFleetList}
+          onLaunchAll={(list) => handleRunMultiSimulation(list)}
+          isLoading={isLoading}
         />
 
-        <CalculationAnalysisOverlay
-          isOpen={isCalculationsOpen}
-          onClose={() => setIsCalculationsOpen(false)}
-          simResult={
-            simResult || (activeSelectedTrack ? {
-              mission_id: activeSelectedTrack.id,
-              metadata: {
-                name: activeSelectedTrack.name,
-                origin: activeSelectedTrack.origin || (multiSimResult?.central_body === "Sun" ? "Earth" : "LEO"),
-                destination: activeSelectedTrack.destination || (multiSimResult?.central_body === "Sun" ? "Mars" : "Orbit"),
-                central_body: multiSimResult?.central_body || "Sun",
-                status: activeSelectedTrack.destroyed ? "FAILED" : "SUCCESS",
-              },
-              delta_v_budget: activeSelectedTrack.delta_v_budget || {
-                total_delta_v: 5600,
-                available_delta_v: 6500,
-                margin_delta_v: 900,
-              },
-              propellant_budget: activeSelectedTrack.propellant_budget || {
-                initial_total_mass_kg: 5000,
-                dry_mass_kg: 2000,
-                initial_fuel_kg: 3000,
-                fuel_consumed_kg: 2200,
-                fuel_margin_kg: 800,
-              },
-              state_history: activeSelectedTrack.state_history.map((s) => ({
-                time_seconds: s.time_seconds,
-                position: s.position,
-                velocity: s.velocity,
-                mass: s.mass,
-                fuel_mass: s.fuel_mass,
-                thrust_active: s.thrust_active,
-                altitude: s.altitude,
-                speed: s.speed,
-              })),
-              calculation_trace: (activeSelectedTrack.calculation_trace && activeSelectedTrack.calculation_trace.length > 0)
-                ? activeSelectedTrack.calculation_trace
-                : (multiSimResult?.calculation_steps || []),
-              events: [],
-              diagnostics: {
-                solver: "RKF45 Adaptive Astrodynamics Engine",
-                numerical_tolerance: "atol=1e-7, rtol=1e-7",
-                scientific_honesty_note: "Rigorous physical variational state propagation",
-              },
-            } : null)
-          }
-          originName={activeSelectedTrack?.origin || origBody.name}
-          destinationName={activeSelectedTrack?.destination || destBody.name}
-          vehicleName={activeSelectedTrack?.name || selectedPreset.name}
-          payloadKg={payloadKg}
-          epochDate={epochDate}
-          isCalculating={isLoading}
-        />
-
-
-        {/* 1. TOP STATUS & NAVIGATION BAR */}
-        <header className="w-full bg-[#050505] border-b border-neutral-800 px-4 py-2 flex items-center justify-between shrink-0 text-xs select-none">
-          <div className="flex items-center space-x-3">
-            <div className="flex items-center space-x-2">
-              <span className="font-['Orbitron'] font-black tracking-widest text-sm text-white">
-                THESEUS
-              </span>
-              <span className="text-neutral-600">/</span>
-              <span className="text-[11px] text-neutral-400 tracking-wider font-semibold">
-                ORBITAL DYNAMICS ENGINE
-              </span>
-            </div>
-
-            <div className="flex items-center space-x-1.5 bg-black border border-neutral-800 px-2 py-0.5 text-[10px]">
-              <span className={`w-1.5 h-1.5 rounded-full ${backendOnline ? "bg-emerald-400 animate-pulse" : "bg-red-500"}`} />
-              <span className={backendOnline ? "text-emerald-400 font-bold" : "text-red-400 font-bold"}>
-                {backendOnline ? "CORE ONLINE" : "CORE OFFLINE"}
-              </span>
-            </div>
-
-            {/* Subsystem Health Indicators */}
-            <div className="hidden lg:flex items-center space-x-1 text-[9px] font-mono">
-              <span className="bg-neutral-900 border border-emerald-900/60 text-emerald-400 px-1.5 py-0.5 rounded">
-                PROPAGATOR
-              </span>
-              <span className="bg-neutral-900 border border-emerald-900/60 text-emerald-400 px-1.5 py-0.5 rounded">
-                TRANSFERS
-              </span>
-              <span className="bg-neutral-900 border border-emerald-900/60 text-emerald-400 px-1.5 py-0.5 rounded">
-                RENDEZVOUS
-              </span>
-              <span className={`px-1.5 py-0.5 rounded border ${
-                backendHealth?.subsystems?.phase_8_reentry?.includes("VALIDATED")
-                  ? "bg-neutral-900 border-emerald-900/60 text-emerald-400"
-                  : "bg-neutral-900 border-neutral-800 text-neutral-500"
-              }`}>
-                REENTRY: {backendHealth?.subsystems?.phase_8_reentry?.includes("VALIDATED") ? "ONLINE" : "STANDBY"}
-              </span>
-              <span className={`px-1.5 py-0.5 rounded border ${
-                backendHealth?.subsystems?.phase_9_collision?.includes("VALIDATED")
-                  ? "bg-neutral-900 border-emerald-900/60 text-emerald-400"
-                  : "bg-neutral-900 border-neutral-800 text-neutral-500"
-              }`}>
-                CONJUNCTION: {backendHealth?.subsystems?.phase_9_collision?.includes("VALIDATED") ? "ONLINE" : "STANDBY"}
-              </span>
-              <span className={`px-1.5 py-0.5 rounded border ${
-                backendHealth?.subsystems?.phase_10_uncertainty?.includes("VALIDATED")
-                  ? "bg-neutral-900 border-emerald-900/60 text-emerald-400"
-                  : "bg-neutral-900 border-neutral-800 text-neutral-500"
-              }`}>
-                UNCERTAINTY: {backendHealth?.subsystems?.phase_10_uncertainty?.includes("VALIDATED") ? "ONLINE" : "STANDBY"}
-              </span>
-            </div>
-          </div>
-
-          {/* Mode Switcher & Fleet Setup */}
-          <div className="flex items-center space-x-2">
-            <div className="bg-black border border-neutral-800 p-0.5 flex text-[11px]">
-              <button
-                onClick={() => {
-                  setSimMode("MULTI");
-                  handleRunMultiSimulation();
-                }}
-                className={`px-2.5 py-1 uppercase font-bold tracking-wider transition-colors ${
-                  simMode === "MULTI"
-                    ? "bg-amber-500 text-black"
-                    : "text-neutral-400 hover:text-white"
-                }`}
-              >
-                Multi-Fleet & Conjunctions
-              </button>
-              <button
-                onClick={() => {
-                  setSimMode("SINGLE");
-                  handleRunSingleSimulation();
-                }}
-                className={`px-2.5 py-1 uppercase font-bold tracking-wider transition-colors ${
-                  simMode === "SINGLE"
-                    ? "bg-amber-500 text-black"
-                    : "text-neutral-400 hover:text-white"
-                }`}
-              >
-                Interplanetary Transfer
-              </button>
-            </div>
-
-            {simMode === "MULTI" ? (
-              <button
-                onClick={() => setIsMultiSetupOpen(true)}
-                className="bg-neutral-900 hover:bg-neutral-800 border border-amber-500/60 text-amber-400 hover:text-white font-['Orbitron'] font-bold px-3 py-1 text-xs transition-all flex items-center space-x-1.5 cursor-pointer"
-              >
-                <Settings2 className="w-3.5 h-3.5" />
-                <span>[ FLEET SETUP ({fleetList.length}) ]</span>
-              </button>
-            ) : (
-              <button
-                onClick={() => setIsSetupOpen(true)}
-                className="bg-neutral-900 hover:bg-neutral-800 border border-amber-500/60 text-amber-400 hover:text-white font-['Orbitron'] font-bold px-3 py-1 text-xs transition-all flex items-center space-x-1.5 cursor-pointer"
-              >
-                <Settings2 className="w-3.5 h-3.5" />
-                <span>[ SET UP MISSION ]</span>
-              </button>
-            )}
-          </div>
-        </header>
-
-        {/* 2. SUB-ACTION BAR */}
-        <div className="w-full bg-[#080808] border-b border-neutral-800 px-4 py-2 flex flex-wrap items-center justify-between gap-3 text-xs shrink-0 select-none">
-          {simMode === "MULTI" ? (
-            <div className="flex items-center gap-3 text-[11px]">
-              <span className="text-amber-400 font-bold">ACTIVE FLEET:</span>
-              <span className="text-white font-semibold">
-                {multiSimResult ? `${multiSimResult.summary.total_spacecraft} Satellites + ${multiSimResult.summary.total_debris} Debris` : `${fleetList.length} Spacecraft`}
-              </span>
-              <span className="text-neutral-600">|</span>
-              <span className="text-neutral-400">
-                Conjunctions: <strong className="text-amber-300">{multiSimResult?.conjunctions.length || 0}</strong>
-              </span>
-              {multiSimResult && multiSimResult.collisions.length > 0 && (
-                <>
-                  <span className="text-neutral-600">|</span>
-                  <span className="text-red-400 font-bold flex items-center gap-1">
-                    <Flame className="w-3 h-3 text-red-400" />
-                    {multiSimResult.collisions.length} PHYSICAL COLLISION(S)
-                  </span>
-                </>
-              )}
-            </div>
-          ) : (
-            <div className="flex items-center gap-3 text-[11px]">
-              <span className="font-bold text-white">{origBody.name.toUpperCase()} → {destBody.name.toUpperCase()}</span>
-              <span className="text-neutral-600">|</span>
-              <span className="text-neutral-400">VEHICLE: <strong className="text-amber-400">{selectedPreset.name}</strong></span>
-              <span className="text-neutral-600">|</span>
-              <span className="text-neutral-400">PAYLOAD: <strong className="text-white">{payloadKg.toLocaleString()} kg</strong></span>
-            </div>
-          )}
-
-          <div className="flex items-center space-x-2">
-            <button
-              onClick={() => setIsCalculationsOpen(true)}
-              className="bg-neutral-900 hover:bg-neutral-800 border border-amber-500/60 text-amber-400 hover:text-white font-['Orbitron'] font-bold px-3 py-1.5 text-xs transition-all flex items-center space-x-1.5 cursor-pointer"
-            >
-              <Terminal className="w-3.5 h-3.5 text-amber-400" />
-              <span>[ &gt; VIEW CALCULATIONS ]</span>
-            </button>
-
-            {simMode === "MULTI" ? (
-              <button
-                onClick={() => handleRunMultiSimulation(fleetList)}
-                disabled={isLoading}
-                className="bg-amber-500 hover:bg-amber-400 text-black font-bold px-3.5 py-1.5 text-xs transition-all flex items-center space-x-1.5 cursor-pointer disabled:opacity-50"
-              >
-                {isLoading ? (
-                  <span>PROPAGATING FLEET...</span>
-                ) : (
-                  <span className="font-['Orbitron'] font-bold tracking-wider flex items-center gap-1">
-                    <Play className="w-3 h-3 fill-black" />
-                    RUN SIMULATION
-                  </span>
-                )}
-              </button>
-            ) : (
-              <button
-                onClick={() => handleRunSingleSimulation(origin, destination, selectedPresetId, payloadKg)}
-                disabled={isLoading}
-                className="bg-amber-500 hover:bg-amber-400 text-black font-bold px-3.5 py-1.5 text-xs transition-all flex items-center space-x-1.5 cursor-pointer disabled:opacity-50"
-              >
-                {isLoading ? (
-                  <span>SOLVING TRANSFER...</span>
-                ) : (
-                  <span className="font-['Orbitron'] font-bold tracking-wider flex items-center gap-1">
-                    <Play className="w-3 h-3 fill-black" />
-                    RUN SIMULATION
-                  </span>
-                )}
-              </button>
-            )}
-          </div>
-        </div>
-
-        {/* Error Notification */}
-        {simulationError && (
-          <div className="bg-red-950/80 border-b border-red-500 px-4 py-2 flex items-center justify-between z-30 shrink-0">
-            <div className="flex items-center space-x-2 text-red-300 text-xs">
-              <AlertTriangle className="w-4 h-4 text-red-400" />
-              <span className="font-bold">ENGINE ERROR:</span>
-              <span className="text-white">{simulationError}</span>
-            </div>
-            <button
-              onClick={() => setSimulationError(null)}
-              className="bg-red-900 border border-red-700 text-white px-2 py-0.5 text-[10px] font-bold"
-            >
-              DISMISS
-            </button>
-          </div>
+        {/* B-Plane Risk Detail Overlay Modal */}
+        {selectedConjunction && (
+          <BPlaneRiskOverlay
+            conjunction={selectedConjunction}
+            onClose={() => setSelectedConjunction(null)}
+          />
         )}
-
-        {/* 3. MAIN SIMULATION VIEWPORT & SIDEBAR */}
-        <main className="flex-1 min-w-0 min-h-0 w-full relative overflow-hidden bg-black flex">
-          
-          {/* Canvas Sandbox */}
-          <div className="flex-1 relative h-full">
-            <Sandbox2D
-              activeRockets={activeRockets}
-              activeExplosions={activeExplosions}
-              simTimeSec={currentTimeSec}
-              multiSimResult={simMode === "MULTI" ? multiSimResult : null}
-              stateHistory={simMode === "SINGLE" ? (simResult?.state_history || []) : []}
-              targetStateHistory={simMode === "SINGLE" ? simResult?.target_state_history : undefined}
-              bodyHistories={simMode === "SINGLE" ? simResult?.bodies : undefined}
-              currentFrameIdx={currentFrameIdx}
-              originBodyName={simMode === "SINGLE" ? (simResult?.metadata.origin || origin) : "Earth"}
-              destinationBodyName={simMode === "SINGLE" ? (simResult?.metadata.destination || destination) : "Mars"}
-              spacecraftPresetId={selectedPresetId}
-              selectedObjectId={selectedObjectId}
-              onSelectObject={(id) => setSelectedObjectId(id)}
-              onSelectConjunction={(conj) => setSelectedConjunction(conj)}
-            />
-
-            {/* Selected Object Live HUD on Top-Right */}
-            {simMode === "MULTI" && activeSelectedTrack && (
-              <div className="absolute top-3 right-3 w-64 bg-black/85 border border-neutral-800 p-2.5 text-xs text-neutral-300 pointer-events-auto z-20 shadow-xl font-mono">
-                <div className="flex items-center justify-between border-b border-neutral-800 pb-1 mb-1.5">
-                  <span className="font-bold text-amber-400">{activeSelectedTrack.name}</span>
-                  <span className={`text-[9px] px-1 py-0.2 uppercase font-bold ${
-                    activeSelectedTrack.destroyed
-                      ? "bg-red-950 text-red-400 border border-red-700"
-                      : "bg-emerald-950 text-emerald-400 border border-emerald-700"
-                  }`}>
-                    {activeSelectedTrack.destroyed ? "DESTROYED" : "ACTIVE"}
-                  </span>
-                </div>
-                {activeSelectedTrack.state_history.length > 0 && (() => {
-                  const idx = Math.min(currentFrameIdx, activeSelectedTrack.state_history.length - 1);
-                  const st = activeSelectedTrack.state_history[idx];
-                  if (!st) return null;
-                  return (
-                    <div className="space-y-1 text-[10px]">
-                      <div className="flex justify-between">
-                        <span className="text-neutral-500">ALTITUDE:</span>
-                        <span className="text-white font-bold">{formatDistance(st.altitude)}</span>
-                      </div>
-                      <div className="flex justify-between">
-                        <span className="text-neutral-500">SPEED:</span>
-                        <span className="text-emerald-400 font-bold">{formatSpeed(st.speed)}</span>
-                      </div>
-                      <div className="flex justify-between">
-                        <span className="text-neutral-500">MASS:</span>
-                        <span className="text-amber-300 font-bold">{formatMass(st.mass)}</span>
-                      </div>
-                      <div className="flex justify-between">
-                        <span className="text-neutral-500">HBR:</span>
-                        <span className="text-neutral-200 font-bold">{activeSelectedTrack.hard_body_radius_m.toFixed(1)} m</span>
-                      </div>
-                    </div>
-                  );
-                })()}
-              </div>
-            )}
-          </div>
-
-          {/* Collapsible Conjunctions Panel Sidebar (Multi Mode) */}
-          {simMode === "MULTI" && multiSimResult && (
-            <div className={`transition-all duration-200 border-l border-neutral-800 flex flex-col z-20 ${
-              showConjunctionsSidebar ? "w-80" : "w-8"
-            }`}>
-              <button
-                onClick={() => setShowConjunctionsSidebar(!showConjunctionsSidebar)}
-                className="w-full bg-neutral-950 border-b border-neutral-800 p-1 text-[10px] text-neutral-400 hover:text-white flex items-center justify-center gap-1"
-                title="Toggle Conjunctions Panel"
-              >
-                {showConjunctionsSidebar ? "HIDE CONJUNCTIONS ✕" : "⚡ CONJ"}
-              </button>
-
-              {showConjunctionsSidebar && (
-                <div className="flex-1 overflow-hidden">
-                  <ConjunctionsPanel
-                    conjunctions={multiSimResult.conjunctions}
-                    collisions={multiSimResult.collisions}
-                    currentTimeSeconds={currentTimeSec}
-                    onSelectConjunction={(conj) => setSelectedConjunction(conj)}
-                    onJumpToTCA={(tca) => handleJumpToTime(tca)}
-                  />
-                </div>
-              )}
-            </div>
-          )}
-
-        </main>
-
-        {/* 4. BOTTOM TIMELINE PLAYBACK SCRUBBER */}
-        <TimelineScrubber
-          currentFrameIdx={currentFrameIdx}
-          totalFrames={totalFrames}
-          currentTimeSeconds={currentTimeSec}
-          totalDurationSeconds={totalDurationSec}
-          isPlaying={isPlaying}
-          playbackSpeed={playbackSpeed}
-          events={
-            simMode === "MULTI" && multiSimResult
-              ? multiSimResult.collisions.map((c) => ({
-                  time: c.time_s,
-                  name: `COLLISION: ${c.spacecraft_a_name} ✕ ${c.spacecraft_b_name}`,
-                  type: "MISSION_FAILURE",
-                  details: `Miss: ${c.miss_distance_m.toFixed(1)}m ≤ HBR ${c.combined_hbr_m.toFixed(1)}m`,
-                }))
-              : (simResult?.events || [])
-          }
-          onSeek={(idx) => setCurrentFrameIdx(idx)}
-          onTogglePlay={() => setIsPlaying(!isPlaying)}
-          onSetSpeed={(spd) => setPlaybackSpeed(spd)}
-          onReset={() => {
-            setCurrentFrameIdx(0);
-            setIsPlaying(false);
-          }}
-        />
-
       </div>
     </ErrorBoundary>
   );

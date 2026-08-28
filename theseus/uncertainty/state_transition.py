@@ -187,6 +187,68 @@ def numerical_jacobian(
     return da_dr, da_dv
 
 
+#: Relative tolerance for deciding whether the analytic gravity(+J2) Jacobian
+#: describes the caller's acceleration model.  The position blocks are compared
+#: relative to the analytic block's largest entry; the measured finite-
+#: difference noise floor for a purely gravitational model is ~3e-10, so this
+#: sits comfortably above the noise and far below any real force contribution.
+ANALYTIC_JACOBIAN_MATCH_RTOL = 1e-7
+
+
+def analytic_jacobian_describes(
+    acc_fn: Callable[[float, np.ndarray, np.ndarray], np.ndarray],
+    t: float,
+    r: np.ndarray,
+    v: np.ndarray,
+    mu: float,
+    j2: Optional[float] = None,
+    radius: Optional[float] = None,
+    rtol: float = ANALYTIC_JACOBIAN_MATCH_RTOL,
+) -> bool:
+    """
+    Does the analytic gravity(+J2) Jacobian actually describe *acc_fn*?
+
+    The analytic Jacobian has terms for point-mass gravity and J2 only, and it
+    asserts ``∂a/∂v = 0``.  Using it for an acceleration model containing drag,
+    solar radiation pressure, third-body gravity or thrust linearises a
+    different dynamical system than the one being propagated -- the nominal
+    trajectory and the variational trajectory then disagree, silently.
+
+    This checks the assertion instead of assuming it, at one state, using
+    central differences of ``acc_fn`` itself:
+
+    * any measurable dependence of the acceleration on velocity disqualifies
+      the analytic Jacobian outright, because it forces that block to zero.
+      The test is exact rather than tolerance-based: for a model with no
+      velocity dependence the differenced accelerations cancel bit-for-bit, so
+      a non-zero result means a velocity-dependent force is present;
+    * the position block must agree with the analytic one to ``rtol``.
+
+    Cost is twelve extra ``acc_fn`` evaluations, once, against twelve *per
+    integration step* if the numerical Jacobian is then used.
+
+    Limitation, stated rather than hidden: this is evaluated at a single
+    state.  A force that is negligible there but significant elsewhere on the
+    trajectory -- drag at the perigee of an eccentric orbit, checked at
+    apogee -- will not be detected.  Callers that know their force model
+    should say so with ``use_analytic_jacobian`` rather than relying on this.
+    """
+    fd_dr, fd_dv = numerical_jacobian(acc_fn, t, r, v)
+
+    if np.any(fd_dv != 0.0):
+        return False
+
+    analytic_dr = gravity_jacobian(r, mu)
+    if j2 is not None and j2 != 0.0 and radius is not None:
+        analytic_dr = analytic_dr + j2_jacobian(r, mu, j2, radius)
+
+    scale = float(np.max(np.abs(analytic_dr)))
+    if scale == 0.0:
+        return bool(np.max(np.abs(fd_dr)) == 0.0)
+
+    return bool(np.max(np.abs(fd_dr - analytic_dr)) <= rtol * scale)
+
+
 def build_dynamics_jacobian(
     da_dr: np.ndarray,
     da_dv: Optional[np.ndarray] = None,
@@ -291,7 +353,17 @@ def propagate_stm(
     atol, rtol : float
         Tolerances for RKF45.
     use_analytic_jacobian : bool
-        If True and mu is provided, use analytic gravity (+ J2) Jacobian.
+        Whether the caller asserts that ``acc_fn`` is point-mass gravity plus,
+        optionally, J2 -- with the same ``mu``, ``j2`` and ``radius`` given
+        here -- and nothing else.  This is a statement about the acceleration
+        model, not a performance preference: the analytic Jacobian has no
+        terms for drag, solar radiation pressure, third-body gravity or
+        thrust, and forces ``∂a/∂v = 0``.
+        The assertion is verified at the reference epoch by
+        :func:`analytic_jacobian_describes`; when it does not hold, the
+        numerical Jacobian is used regardless and ``method`` says so.  Callers
+        whose force model contains a non-gravitational term should pass False
+        rather than rely on that check, which sees only one state.
 
     Returns
     -------
@@ -311,13 +383,61 @@ def propagate_stm(
             method="identity_t0",
         )
 
+    # Backward propagation is not supported, and used to fail silently.
+    #
+    # The integration loop steps forward from t0 with a positive step and
+    # terminates immediately when tf < t0, so the augmented state was returned
+    # with Phi still at its initial value.  Measured over a 600 s span:
+    #
+    #     ||Phi_back - I||_F           = 0.000000e+00
+    #     ||Phi_back @ Phi_fwd - I||_F = 1.046464e+03
+    #
+    # In other words a backward request returned exactly the identity, and a
+    # covariance mapped through it -- P(t) = Phi P0 Phi^T -- came back
+    # unchanged, as though it had been propagated with no dynamics at all.  A
+    # wrong answer that looks like a plausible one is the failure mode B-2 and
+    # P10-08 both exist to remove.
+    #
+    # The Phase 10 pipeline only ever propagates from the covariance epoch
+    # forward to TCA, so nothing in production reaches this; raising costs no
+    # existing behaviour and closes the trap for any future caller.  Callers
+    # who genuinely want the backward map should propagate forward and invert,
+    # which is well conditioned for a symplectic Phi.
+    if tf < t0:
+        raise ValueError(
+            f"propagate_stm does not support backward propagation "
+            f"(t0={t0!r}, tf={tf!r}). The integrator steps forward only and "
+            f"would return the identity matrix, which reads as a valid state "
+            f"transition matrix while describing no dynamics at all. "
+            f"Propagate forward over ({tf!r}, {t0!r}) and invert the result."
+        )
+
     # Initial condition: state (6) + vec(I₆) (36)
     phi0 = np.eye(6, dtype=np.float64)
     y0 = np.concatenate([r0, v0, phi0.flatten()])
 
+    # Choosing the Jacobian.
+    #
+    # This used to be `use_analytic_jacobian and mu is not None`, which asks
+    # only whether an analytic Jacobian *could* be built -- never whether it
+    # describes `acc_fn`.  A caller propagating gravity + J2 + drag and passing
+    # mu (which the multi-object Phase 10 path always did) therefore got a
+    # gravity-only Jacobian with the velocity block forced to zero, and the
+    # variational equations linearised a different dynamical system than the
+    # one generating the nominal trajectory.
+    #
+    # The analytic path is now taken only when the caller asks for it *and*
+    # the analytic model is verified to reproduce acc_fn at the reference
+    # epoch.  The verification costs twelve acceleration evaluations once;
+    # the numerical Jacobian costs twelve per integration step, so a correct
+    # analytic case pays almost nothing for the check.
     can_use_analytic = (
         use_analytic_jacobian and (mu is not None and mu > 0.0)
     )
+    if can_use_analytic:
+        can_use_analytic = analytic_jacobian_describes(
+            acc_fn, t0, r0, v0, mu, j2=j2, radius=radius,
+        )
 
     method_str = "analytic_jacobian" if can_use_analytic else "numerical_jacobian"
 

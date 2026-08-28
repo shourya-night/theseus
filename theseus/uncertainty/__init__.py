@@ -61,6 +61,7 @@ from theseus.uncertainty.risk import (
     RiskThresholds,
     RiskAssessment,
     classify_risk,
+    indeterminate_risk,
     PROFILE_CONSERVATIVE,
     PROFILE_STANDARD,
     PROFILE_PERMISSIVE,
@@ -69,6 +70,9 @@ from theseus.uncertainty.results import (
     UncertaintyConjunctionResult,
     run_uncertainty_conjunction_analysis,
     build_phase10_calculation_trace,
+    build_indeterminate_calculation_trace,
+    STATUS_COMPLETE,
+    STATUS_INDETERMINATE,
 )
 
 __all__ = [
@@ -113,6 +117,7 @@ __all__ = [
     "RiskThresholds",
     "RiskAssessment",
     "classify_risk",
+    "indeterminate_risk",
     "PROFILE_CONSERVATIVE",
     "PROFILE_STANDARD",
     "PROFILE_PERMISSIVE",
@@ -120,4 +125,7 @@ __all__ = [
     "UncertaintyConjunctionResult",
     "run_uncertainty_conjunction_analysis",
     "build_phase10_calculation_trace",
+    "build_indeterminate_calculation_trace",
+    "STATUS_COMPLETE",
+    "STATUS_INDETERMINATE",
 ]

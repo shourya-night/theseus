@@ -31,6 +31,16 @@ within a bracketed interval.
 
 Reference: Brent, "Algorithms for Minimization Without Derivatives",
 Prentice-Hall, 1973.
+
+Input validation
+----------------
+The search is driven entirely by the sign of f(t).  With a non-finite state,
+f(t) is NaN and every comparison against it is False, so no bracket is ever
+found and the search reports "no closest approach" -- a valid-looking negative
+answer derived from no information at all.  Every state the solver evaluates is
+therefore checked for finiteness first, and a non-finite component raises
+:class:`~theseus.conjunction.state_validation.NonFiniteStateError`.  The
+bracketing rule, Brent iteration and minimum validation are unchanged.
 """
 
 from __future__ import annotations
@@ -40,6 +50,11 @@ from typing import Callable, Optional
 
 import math
 import numpy as np
+
+from theseus.conjunction.state_validation import (
+    guard_position_functions,
+    guard_velocity_functions,
+)
 
 
 @dataclass
@@ -202,6 +217,9 @@ def find_tca(
     t_start: float,
     t_end: float,
     tol: float = 1e-6,
+    *,
+    object_a_id: str = "A",
+    object_b_id: str = "B",
 ) -> Optional[TCAResult]:
     """
     Find the TCA within [t_start, t_end] using Brent's method.
@@ -219,11 +237,24 @@ def find_tca(
         Bracket for TCA search.
     tol : float
         Convergence tolerance (s).
+    object_a_id, object_b_id : str
+        Labels used in a non-finite-state diagnostic.
 
     Returns
     -------
     TCAResult or None if no valid TCA found.
+
+    Raises
+    ------
+    NonFiniteStateError
+        If any state evaluated during the search is not finite.  "No TCA
+        found" is never reported for a non-finite trajectory.
     """
+    pos_fn_a, pos_fn_b = guard_position_functions(
+        pos_fn_a, pos_fn_b, object_a_id=object_a_id, object_b_id=object_b_id)
+    vel_fn_a, vel_fn_b = guard_velocity_functions(
+        vel_fn_a, vel_fn_b, object_a_id=object_a_id, object_b_id=object_b_id)
+
     def f(t: float) -> float:
         r_rel = np.asarray(pos_fn_a(t)) - np.asarray(pos_fn_b(t))
         v_rel = np.asarray(vel_fn_a(t)) - np.asarray(vel_fn_b(t))
@@ -318,6 +349,125 @@ def find_tca(
     )
 
 
+@dataclass(frozen=True)
+class TCASearchDiagnostics:
+    """
+    What a TCA search over one interval actually attempted and achieved.
+
+    These counts exist only inside the search loop, so they are reported here
+    rather than re-derived by a caller.  Note that ``brackets_found`` may
+    exceed one per interval: a single candidate interval can contain several
+    sign changes of r_rel · v_rel, hence several distinct closest approaches.
+
+    Attributes
+    ----------
+    samples : int
+        Number of samples of f(t) = r_rel · v_rel taken.
+    brackets_found : int
+        Negative-to-positive sign changes located, i.e. the number of
+        refinement attempts made.
+    attempts : int
+        Refinements attempted.  Equal to ``brackets_found``.
+    converged : int
+        Refinements whose solver converged.
+    non_converged : int
+        Refinements attempted whose solver did not converge, and which were
+        therefore discarded.
+    """
+    samples: int
+    brackets_found: int
+    attempts: int
+    converged: int
+    non_converged: int
+
+    def to_dict(self) -> dict:
+        return {
+            "samples": int(self.samples),
+            "brackets_found": int(self.brackets_found),
+            "attempts": int(self.attempts),
+            "converged": int(self.converged),
+            "non_converged": int(self.non_converged),
+        }
+
+
+def find_all_tca_with_diagnostics(
+    pos_fn_a: Callable[[float], np.ndarray],
+    vel_fn_a: Callable[[float], np.ndarray],
+    pos_fn_b: Callable[[float], np.ndarray],
+    vel_fn_b: Callable[[float], np.ndarray],
+    t_start: float,
+    t_end: float,
+    n_samples: int = 500,
+    tol: float = 1e-6,
+    *,
+    object_a_id: str = "A",
+    object_b_id: str = "B",
+) -> tuple[list[TCAResult], TCASearchDiagnostics]:
+    """
+    Find all TCA events within [t_start, t_end], and report the search counts.
+
+    Identical search and refinement to :func:`find_all_tca`; this variant also
+    returns how many brackets were located and how many refinements converged,
+    so a calculation trace can distinguish an attempt from a success.
+
+    Returns
+    -------
+    (results, diagnostics)
+        ``results`` holds the converged TCA solutions, sorted by time.  A
+        converged solution is not automatically a valid minimum -- check
+        ``TCAResult.validated`` for that.
+
+    Raises
+    ------
+    NonFiniteStateError
+        If any state evaluated during the search is not finite.  An empty
+        result list is only ever produced from finite states.
+    """
+    pos_fn_a, pos_fn_b = guard_position_functions(
+        pos_fn_a, pos_fn_b, object_a_id=object_a_id, object_b_id=object_b_id)
+    vel_fn_a, vel_fn_b = guard_velocity_functions(
+        vel_fn_a, vel_fn_b, object_a_id=object_a_id, object_b_id=object_b_id)
+
+    def f(t: float) -> float:
+        r_rel = np.asarray(pos_fn_a(t)) - np.asarray(pos_fn_b(t))
+        v_rel = np.asarray(vel_fn_a(t)) - np.asarray(vel_fn_b(t))
+        return float(np.dot(r_rel, v_rel))
+
+    sample_times = np.linspace(t_start, t_end, n_samples)
+    f_values = np.array([f(t) for t in sample_times])
+
+    results: list[TCAResult] = []
+    brackets = 0
+    attempts = 0
+    non_converged = 0
+
+    for i in range(len(f_values) - 1):
+        # Only negative → positive = local minimum
+        if f_values[i] < 0 and f_values[i + 1] >= 0:
+            brackets += 1
+            t_a = float(sample_times[i])
+            t_b = float(sample_times[i + 1])
+            attempts += 1
+            result = find_tca(
+                pos_fn_a, vel_fn_a, pos_fn_b, vel_fn_b,
+                t_a, t_b, tol=tol,
+                object_a_id=object_a_id, object_b_id=object_b_id,
+            )
+            if result is not None and result.converged:
+                results.append(result)
+            else:
+                non_converged += 1
+
+    diagnostics = TCASearchDiagnostics(
+        samples=int(n_samples),
+        brackets_found=brackets,
+        attempts=attempts,
+        converged=len(results),
+        non_converged=non_converged,
+    )
+    return sorted(results, key=lambda r: r.tca), diagnostics
+
+
 def find_all_tca(
     pos_fn_a: Callable[[float], np.ndarray],
     vel_fn_a: Callable[[float], np.ndarray],
@@ -327,6 +477,9 @@ def find_all_tca(
     t_end: float,
     n_samples: int = 500,
     tol: float = 1e-6,
+    *,
+    object_a_id: str = "A",
+    object_b_id: str = "B",
 ) -> list[TCAResult]:
     """
     Find ALL TCA events within [t_start, t_end].
@@ -337,28 +490,13 @@ def find_all_tca(
     Returns
     -------
     list[TCAResult]
-        All validated TCA events, sorted by time.
+        All converged TCA events, sorted by time.  Callers that need to know
+        how many refinements were attempted, or how many failed, should use
+        :func:`find_all_tca_with_diagnostics`.
     """
-    def f(t: float) -> float:
-        r_rel = np.asarray(pos_fn_a(t)) - np.asarray(pos_fn_b(t))
-        v_rel = np.asarray(vel_fn_a(t)) - np.asarray(vel_fn_b(t))
-        return float(np.dot(r_rel, v_rel))
-
-    sample_times = np.linspace(t_start, t_end, n_samples)
-    f_values = np.array([f(t) for t in sample_times])
-
-    results: list[TCAResult] = []
-
-    for i in range(len(f_values) - 1):
-        # Only negative → positive = local minimum
-        if f_values[i] < 0 and f_values[i + 1] >= 0:
-            t_a = float(sample_times[i])
-            t_b = float(sample_times[i + 1])
-            result = find_tca(
-                pos_fn_a, vel_fn_a, pos_fn_b, vel_fn_b,
-                t_a, t_b, tol=tol,
-            )
-            if result is not None and result.converged:
-                results.append(result)
-
-    return sorted(results, key=lambda r: r.tca)
+    results, _ = find_all_tca_with_diagnostics(
+        pos_fn_a, vel_fn_a, pos_fn_b, vel_fn_b,
+        t_start, t_end, n_samples=n_samples, tol=tol,
+        object_a_id=object_a_id, object_b_id=object_b_id,
+    )
+    return results

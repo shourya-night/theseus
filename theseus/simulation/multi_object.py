@@ -29,16 +29,20 @@ from theseus.orbital.conversions import elements_to_state, state_to_elements
 from theseus.orbital.elements import OrbitalElements
 from theseus.orbital.lambert import solve_lambert, LambertSolution
 
+from theseus.propagation.interpolation import interpolator_from_state_history
 from theseus.conjunction.screening import ConjunctionScreener, CandidateInterval
 from theseus.conjunction.tca import find_all_tca, TCAResult
 from theseus.conjunction.b_plane import compute_b_plane, BPlaneResult
 from theseus.conjunction.analysis import classify_encounter
+from theseus.conjunction.geometry import (
+    CollisionGeometry, CollisionStatus, assess_collision_geometry,
+)
 from theseus.uncertainty.covariance import StateCovariance
 from theseus.uncertainty.state_transition import propagate_stm
 from theseus.uncertainty.propagation import propagate_covariance
 from theseus.uncertainty.relative import compute_relative_covariance
 from theseus.uncertainty.b_plane import project_covariance_to_b_plane
-from theseus.uncertainty.hard_body import compute_hard_body_radius, HardBodyResult, CollisionGeometry
+from theseus.uncertainty.hard_body import compute_hard_body_radius, HardBodyResult
 from theseus.uncertainty.collision_probability import compute_collision_probability, CollisionProbabilityResult
 from theseus.uncertainty.risk import classify_risk, RiskAssessment, RiskThresholds, PROFILE_STANDARD
 
@@ -161,6 +165,16 @@ def get_planet_state_at_time(planet_name: str, time_sec: float = 0.0) -> Tuple[n
     return pos, vel
 
 
+class SolarRadiationPressureUnavailable(NotImplementedError):
+    """
+    Raised when ``enable_srp=True`` is requested.
+
+    See ``MultiObjectEnvironment._build_force_model``: the option is declared
+    throughout the API surface but the force model has never been constructible,
+    so it is refused explicitly rather than crashing with a TypeError.
+    """
+
+
 @dataclass
 class SpacecraftDefinition:
     """
@@ -202,7 +216,10 @@ class SpacecraftDefinition:
     arg_periapsis_deg: Optional[float] = 0.0
     true_anomaly_deg: Optional[float] = 0.0
     
-    # Phase 10 Uncertainty & Hard Body
+    # Collision geometry (Phase 9) and state uncertainty (Phase 10).
+    # hard_body_radius_m is the radius of the sphere enclosing the object
+    # including appendages; it is the single source of this object's collision
+    # size and is adapted into a CollisionGeometry by get_collision_geometry().
     hard_body_radius_m: float = 5.0
     sigma_pos_m: Optional[List[float]] = field(default_factory=lambda: [100.0, 100.0, 100.0])
     sigma_vel_m_s: Optional[List[float]] = field(default_factory=lambda: [0.1, 0.1, 0.1])
@@ -251,6 +268,21 @@ class SpacecraftDefinition:
         sv = self.sigma_vel_m_s or [0.1, 0.1, 0.1]
         return StateCovariance.from_diagonal(sigma_pos=sp, sigma_vel=sv, name=self.name)
 
+    def get_collision_geometry(self) -> CollisionGeometry:
+        """
+        Adapt this definition's hard-body radius into a CollisionGeometry.
+
+        No new dimension is introduced: ``hard_body_radius_m`` remains the one
+        place this object's collision size is defined, and this method only
+        presents it in the form the Phase 9 geometry model expects.
+        """
+        return CollisionGeometry.from_radius(
+            radius_m=self.hard_body_radius_m,
+            name=self.name,
+            object_type="debris" if self.is_debris else "payload",
+            source="SpacecraftDefinition.hard_body_radius_m",
+        )
+
 
 @dataclass
 class MultiConjunctionEvent:
@@ -275,6 +307,8 @@ class MultiConjunctionEvent:
     b_plane_covariance_m2: Optional[List[List[float]]] = None
     hard_body_radius_m: float = 10.0
     collision_probability: Optional[float] = None
+    clearance_m: Optional[float] = None
+    collision_status: str = "UNKNOWN"
     risk_level: str = "LOW"
     action_required: bool = False
     is_physical_collision: bool = False
@@ -312,6 +346,9 @@ class MultiConjunctionEvent:
             "risk_level": self.risk_level,
             "action_required": self.action_required,
             "is_physical_collision": self.is_physical_collision,
+            "collision_status": self.collision_status,
+            "clearance_m": (None if self.clearance_m is None else float(self.clearance_m)),
+            "clearance_km": (None if self.clearance_m is None else float(self.clearance_m) / 1e3),
         }
 
 
@@ -566,6 +603,56 @@ class MultiObjectEnvironment:
         self.enable_drag = enable_drag
         self.enable_srp = enable_srp
 
+    @staticmethod
+    def _analytic_jacobian_covers(force_model: CompositeForceModel) -> bool:
+        """
+        Is the STM's analytic Jacobian complete for this force model?
+
+        The analytic Jacobian in ``theseus.uncertainty.state_transition`` has
+        terms for point-mass gravity and J2 only, and asserts ∂a/∂v = 0.  Drag
+        depends on both position (through density and the co-rotating
+        atmosphere) and velocity; SRP and any third-body term depend on
+        position.  Whenever one of those is active the analytic Jacobian
+        describes a different dynamical system than the one being propagated,
+        so the STM must be built from the numerical Jacobian of the actual
+        acceleration.
+
+        Decided from the assembled force model rather than from the
+        ``enable_*`` flags, so a model composed by any other route is judged
+        by what it actually contains -- and rather than from the trajectory,
+        so an eccentric orbit whose drag is negligible at the reference epoch
+        but significant at perigee is still handled correctly.
+        """
+        return all(
+            isinstance(model, (PointMassGravity, J2Perturbation))
+            for model in force_model.active_models
+        )
+
+    @staticmethod
+    def _analytic_j2_for(force_model: CompositeForceModel,
+                         body_j2: float) -> float:
+        """
+        The J2 coefficient the analytic Jacobian should be built with, which is
+        the one this force model actually applies -- not the one the central
+        body happens to have.
+
+        The STM call site used to pass ``j2=self.body.J2`` unconditionally.
+        For a two-body-only force model (``enable_j2=False``, which the
+        ``/api/simulate/environment`` endpoint exposes) that describes a
+        different dynamical system than the trajectory, so P10-06's guard
+        rejected the analytic Jacobian and the STM fell back to the numerical
+        one -- twelve extra acceleration evaluations per integration step for
+        no reason.  Measured: gravity-only model with ``j2 = 1.08263e-3``
+        passed is rejected; with ``j2 = 0.0`` it is accepted.
+
+        The result was never wrong, because the guard caught the mismatch every
+        time.  It was needlessly slow, and it made the guard fire on a case it
+        was not written for, which obscures the cases it was.
+        """
+        has_j2 = any(isinstance(model, J2Perturbation)
+                     for model in force_model.active_models)
+        return float(body_j2) if has_j2 else 0.0
+
     def _build_force_model(self, sc_def: SpacecraftDefinition) -> CompositeForceModel:
         """Assemble active physical force models for a spacecraft."""
         fm = CompositeForceModel()
@@ -587,10 +674,32 @@ class MultiObjectEnvironment:
             
         # 4. Solar Radiation Pressure
         if self.enable_srp:
-            srp_area = sc_def.cross_section_area_m2
-            srp_cr = sc_def.reflectivity_coefficient
-            fm.add(SolarRadiationPressure(area=srp_area, cr=srp_cr))
-            
+            # SolarRadiationPressure requires an ephemeris provider -- it needs
+            # to know where the Sun is -- and this call site never supplied one,
+            # so `enable_srp=True` raised
+            #
+            #     TypeError: SolarRadiationPressure.__init__() missing 1
+            #     required positional argument: 'ephemeris'
+            #
+            # every time.  Reached through /api/simulate/environment, which
+            # documents `enable_srp` as a supported option, that surfaced as a
+            # bare HTTP 500.
+            #
+            # Passing an ephemeris here would make the flag "work", but it
+            # would also switch on a perturbation this project has never
+            # validated end to end, silently changing every trajectory of
+            # anyone who sets it.  A documented option that has never run is
+            # not made trustworthy by making it run; it is made honest by
+            # saying it is not available.  The wiring is recorded as a known
+            # limitation instead.
+            raise SolarRadiationPressureUnavailable(
+                "Solar radiation pressure is not available: the force-model "
+                "assembly has no ephemeris provider to locate the Sun, and the "
+                "perturbation has not been validated in this configuration. "
+                "Re-run with enable_srp=false. This is a known limitation, not "
+                "a transient failure."
+            )
+
         return fm
 
     def simulate(
@@ -603,6 +712,22 @@ class MultiObjectEnvironment:
         """
         Execute multi-object simulation across all spacecraft.
         Automatically resolves interplanetary Lambert transfers when destination bodies are specified.
+
+        Note on ``output_dt``
+        --------------------
+        This is **not** a fixed output grid.  It is passed to the propagator as
+        the *initial* integrator step; from there the RKF45 error controller
+        chooses every subsequent step, so the actual node spacing is whatever
+        the requested tolerances demand.  For a 400 km LEO trajectory at the
+        tolerances used here that settles at roughly 69 s regardless of whether
+        10 s, 30 s or 120 s was requested -- only the first step reflects the
+        request.
+
+        This is correct behaviour for an adaptive integrator and is not forced
+        to a uniform grid.  It does not limit downstream accuracy: states
+        between nodes are reconstructed by cubic Hermite interpolation using
+        the stored velocities, which is sub-metre at this spacing, so any
+        consumer may evaluate the trajectory at any instant it likes.
         """
         if not spacecraft_list:
             return MultiObjectSimulationResult(
@@ -695,41 +820,15 @@ class MultiObjectEnvironment:
             prop_histories[sc.id] = history
 
             
-            # Build continuous interpolator
-            times_arr = history.times
-            pos_arr = history.positions
-            vel_arr = history.velocities
-            
-            def make_interp(t_arr, p_arr, v_arr):
-                def pos_fn(t: float) -> np.ndarray:
-                    t_clamped = max(t_arr[0], min(t_arr[-1], t))
-                    idx = np.searchsorted(t_arr, t_clamped)
-                    if idx == 0:
-                        return p_arr[0].copy()
-                    if idx >= len(t_arr):
-                        return p_arr[-1].copy()
-                    dt = t_arr[idx] - t_arr[idx - 1]
-                    if dt < 1e-12:
-                        return p_arr[idx].copy()
-                    frac = (t_clamped - t_arr[idx - 1]) / dt
-                    return (1.0 - frac) * p_arr[idx - 1] + frac * p_arr[idx]
-
-                def vel_fn(t: float) -> np.ndarray:
-                    t_clamped = max(t_arr[0], min(t_arr[-1], t))
-                    idx = np.searchsorted(t_arr, t_clamped)
-                    if idx == 0:
-                        return v_arr[0].copy()
-                    if idx >= len(t_arr):
-                        return v_arr[-1].copy()
-                    dt = t_arr[idx] - t_arr[idx - 1]
-                    if dt < 1e-12:
-                        return v_arr[idx].copy()
-                    frac = (t_clamped - t_arr[idx - 1]) / dt
-                    return (1.0 - frac) * v_arr[idx - 1] + frac * v_arr[idx]
-
-                return pos_fn, vel_fn
-
-            interpolators[sc.id] = make_interp(times_arr, pos_arr, vel_arr)
+            # Build the continuous trajectory interpolator.
+            #
+            # Cubic Hermite, using the velocities the propagator already stored
+            # at every node.  Linear interpolation of position discards those
+            # velocities and replaces each arc by its chord, which at LEO node
+            # spacing costs kilometres -- far more than the miss distances the
+            # conjunction pipeline downstream is trying to resolve.
+            trajectory_interp = interpolator_from_state_history(history)
+            interpolators[sc.id] = trajectory_interp.as_callables()
 
         calc_steps.append({
             "stepIndex": step_idx,
@@ -769,7 +868,14 @@ class MultiObjectEnvironment:
                 pos_a_fn, vel_a_fn = interpolators[id_a]
                 pos_b_fn, vel_b_fn = interpolators[id_b]
                 
-                candidates = screener.screen(pos_a_fn, pos_b_fn, t_start, sim_t_end)
+                candidates = screener.screen(
+                    pos_a_fn, pos_b_fn, t_start, sim_t_end,
+                    vel_fn_a=vel_a_fn, vel_fn_b=vel_b_fn,
+                    # Name the actual spacecraft, so a non-finite trajectory
+                    # is reported against the object it belongs to rather
+                    # than against an anonymous "A"/"B" of some pair.
+                    object_a_id=id_a, object_b_id=id_b,
+                )
                 if not candidates:
                     continue
 
@@ -778,6 +884,7 @@ class MultiObjectEnvironment:
                         pos_a_fn, vel_a_fn, pos_b_fn, vel_b_fn,
                         ci.t_start, ci.t_end,
                         tol=self.tca_tol,
+                        object_a_id=id_a, object_b_id=id_b,
                     )
                     for tca in tcas:
                         if not tca.validated:
@@ -804,33 +911,72 @@ class MultiObjectEnvironment:
                         acc_fn_a = lambda t, r, v: fm_a.compute_acceleration(t, r, v, m_a_tot)
                         acc_fn_b = lambda t, r, v: fm_b.compute_acceleration(t, r, v, m_b_tot)
                         
-                        stm_dt = max(60.0, (tca.tca - t_start) / 200.0)
+                        # --- Epochs, named explicitly -------------------------
+                        #
+                        # covariance_epoch_s : where cov_*_0 is defined, i.e.
+                        #     the propagation start.  This is also the STM's
+                        #     reference epoch, because P(t) = Phi P0 Phi^T is
+                        #     only meaningful when both share one epoch.
+                        # tca_epoch_s : where the covariance is evaluated.
+                        #
+                        # propagate_stm establishes Phi = I at t_span[0] and
+                        # integrates [r, v, vec(Phi)] forward together, so its
+                        # (r0, v0) argument is the nominal state *at the
+                        # reference epoch* -- the trajectory the variational
+                        # equations are linearised about -- and not the state
+                        # to evaluate at.  Passing tca.r_a / tca.v_a here made
+                        # Phi the transition matrix of a trajectory that leaves
+                        # the covariance epoch already holding the state the
+                        # object only reaches at TCA: a trajectory that never
+                        # existed.  Measured on an e = 0.6 orbit that put the
+                        # matrix 67 % away from the true Phi and shrank the
+                        # reported position uncertainty at TCA to 0.27x, with
+                        # the B-plane ellipse misoriented even for e = 0.
+                        covariance_epoch_s = t_start
+                        tca_epoch_s = tca.tca
+
+                        r_a_at_covariance_epoch, v_a_at_covariance_epoch = \
+                            resolved_initial_states[id_a]
+                        r_b_at_covariance_epoch, v_b_at_covariance_epoch = \
+                            resolved_initial_states[id_b]
+
+                        # The Jacobian must describe the same acceleration
+                        # model that produced the nominal trajectory, so each
+                        # object's force model decides which one is valid.
+                        analytic_ok_a = self._analytic_jacobian_covers(fm_a)
+                        analytic_ok_b = self._analytic_jacobian_covers(fm_b)
+                        body_j2 = float(getattr(self.body, "J2", 0.0) or 0.0)
+                        analytic_j2_a = self._analytic_j2_for(fm_a, body_j2)
+                        analytic_j2_b = self._analytic_j2_for(fm_b, body_j2)
+
+                        stm_dt = max(60.0, (tca_epoch_s - covariance_epoch_s) / 200.0)
                         stm_a = propagate_stm(
                             acc_fn_a,
-                            tca.r_a, tca.v_a,
-                            (t_start, tca.tca),
+                            r_a_at_covariance_epoch, v_a_at_covariance_epoch,
+                            (covariance_epoch_s, tca_epoch_s),
                             mu=self.body.mu,
-                            j2=getattr(self.body, "J2", 0.0),
+                            j2=analytic_j2_a,
                             radius=self.body.radius,
                             dt=stm_dt,
                             atol=atol_val,
                             rtol=rtol_val,
+                            use_analytic_jacobian=analytic_ok_a,
                         )
                         stm_b = propagate_stm(
                             acc_fn_b,
-                            tca.r_b, tca.v_b,
-                            (t_start, tca.tca),
+                            r_b_at_covariance_epoch, v_b_at_covariance_epoch,
+                            (covariance_epoch_s, tca_epoch_s),
                             mu=self.body.mu,
-                            j2=getattr(self.body, "J2", 0.0),
+                            j2=analytic_j2_b,
                             radius=self.body.radius,
                             dt=stm_dt,
                             atol=atol_val,
                             rtol=rtol_val,
+                            use_analytic_jacobian=analytic_ok_b,
                         )
 
-                        
-                        cov_a_tca = propagate_covariance(cov_a_0, stm_a.stm, tca.tca)
-                        cov_b_tca = propagate_covariance(cov_b_0, stm_b.stm, tca.tca)
+                        cov_a_tca = propagate_covariance(cov_a_0, stm_a.stm, tca_epoch_s)
+                        cov_b_tca = propagate_covariance(cov_b_0, stm_b.stm, tca_epoch_s)
                         
                         rel_cov = compute_relative_covariance(cov_a_tca, cov_b_tca)
                         
@@ -842,16 +988,21 @@ class MultiObjectEnvironment:
                             b_plane_result=b_res,
                         )
                         
-                        # Combined Hard-Body Radius
-                        combined_hbr = sc_a.hard_body_radius_m + sc_b.hard_body_radius_m
-                        
-                        # Collision Probability Pc
+                        # Deterministic collision geometry.  The Phase 9 model
+                        # owns this decision; nothing here re-derives it.
+                        collision = assess_collision_geometry(
+                            miss_distance_m=miss_d,
+                            geom_a=sc_a.get_collision_geometry(),
+                            geom_b=sc_b.get_collision_geometry(),
+                        )
+                        combined_hbr = collision.combined_hard_body_radius_m
+                        is_collision = collision.is_physical_intersection
+
+                        # Probability of collision is a separate, probabilistic
+                        # question and stays in Phase 10.
                         pc_res = compute_collision_probability(b_unc, combined_hbr)
                         risk_res = classify_risk(pc_res.probability, PROFILE_STANDARD)
-                        
-                        # Authoritative Physical Collision Condition
-                        is_collision = (miss_d <= combined_hbr)
-                        
+
                         event_id = f"CONJ-{id_a}-{id_b}-{tca.tca:.1f}"
                         conj_event = MultiConjunctionEvent(
                             event_id=event_id,
@@ -877,6 +1028,8 @@ class MultiObjectEnvironment:
                             risk_level=risk_res.level.value,
                             action_required=risk_res.action_required,
                             is_physical_collision=is_collision,
+                            clearance_m=collision.clearance_m,
+                            collision_status=collision.status.value,
                         )
                         all_conjunctions.append(conj_event)
                         
@@ -1019,10 +1172,9 @@ class MultiObjectEnvironment:
 
                 full_history_dicts: List[Dict[str, Any]] = []
                 base_times = prop_histories[sc_ids[0]].times
-                d_times = d_hist.times
-                d_pos = d_hist.positions
-                d_vel = d_hist.velocities
-                
+                debris_interp = interpolator_from_state_history(d_hist)
+
+
                 for t in base_times:
                     if t < t_coll:
                         full_history_dicts.append({
@@ -1037,19 +1189,13 @@ class MultiObjectEnvironment:
                             "active": False,
                         })
                     else:
-                        idx = np.searchsorted(d_times, t)
-                        if idx == 0:
-                            pos_t = d_pos[0]
-                            vel_t = d_vel[0]
-                        elif idx >= len(d_times):
-                            pos_t = d_pos[-1]
-                            vel_t = d_vel[-1]
-                        else:
-                            dt = d_times[idx] - d_times[idx - 1]
-                            frac = (t - d_times[idx - 1]) / dt if dt > 1e-12 else 0.0
-                            pos_t = (1.0 - frac) * d_pos[idx - 1] + frac * d_pos[idx]
-                            vel_t = (1.0 - frac) * d_vel[idx - 1] + frac * d_vel[idx]
-                            
+                        # Same Hermite interpolation as the primary tracks, so
+                        # debris output is resampled at the same fidelity.
+                        debris_state = debris_interp.state_at(float(t))
+                        pos_t = debris_state.position
+                        vel_t = debris_state.velocity
+
+
                         full_history_dicts.append({
                             "time_seconds": float(t),
                             "position": pos_t.tolist(),

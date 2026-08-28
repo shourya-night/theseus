@@ -16,7 +16,7 @@ import {
   PLANETARY_ORBITAL_ELEMENTS,
   getPlanetStateAtTime
 } from "../../data/celestialCatalog";
-import { getRocketStateAtTime } from "../../lib/simulationClock";
+import { getRocketStateAtTime, getRocketLifecycleState } from "../../lib/simulationClock";
 import { 
   renderStarField, 
   drawPixelPlanet, 
@@ -412,14 +412,12 @@ export const Sandbox2D: React.FC<Sandbox2DProps> = ({
         });
         ctx.stroke();
 
-        // Check if rocket is destroyed by Sun or collided at current simTimeSec
+        // Evaluate rocket lifecycle state and position at simTimeSec independently per rocket
+        const lifecycle = getRocketLifecycleState(r, simTimeSec);
         const curSt = getRocketStateAtTime(r, simTimeSec);
-        const distSun = curSt ? Math.hypot(curSt.position[0], curSt.position[1], curSt.position[2]) : Infinity;
-        const isSunDestroyed = distSun < 2.0e9 || r.collisionState === "DESTROYED_BY_SUN";
-        const isCollided = r.collisionState === "COLLIDED" && simTimeSec >= (r.collisionTimeSec || 0);
 
-        // Deterministic Priority: Sun Destruction -> Rocket Collision
-        if (isSunDestroyed) {
+        // Deterministic Priority: Sun Destruction -> Rocket Collision -> Active / Arrived Flight
+        if (lifecycle === "DESTROYED_BY_SUN") {
           const sunScreen = worldToScreen(0, 0, width, height);
           ctx.save();
           ctx.translate(sunScreen.x, sunScreen.y);
@@ -431,7 +429,7 @@ export const Sandbox2D: React.FC<Sandbox2DProps> = ({
           ctx.fillText("DESTROYED BY SUN", 0, -30);
           ctx.fillText(`${r.id} SOLAR IMPACT`, 0, -18);
           ctx.restore();
-        } else if (isCollided && r.collisionPosM) {
+        } else if (lifecycle === "COLLIDED" && r.collisionPosM) {
           // Render Historical Impact Location Label
           const expScreen = worldToScreen(r.collisionPosM[0], r.collisionPosM[1], width, height);
           ctx.save();
@@ -442,9 +440,8 @@ export const Sandbox2D: React.FC<Sandbox2DProps> = ({
           ctx.fillText("COLLISION IMPACT SITE", 0, -12);
           ctx.fillText(`${r.id} DESTROYED`, 0, -2);
           ctx.restore();
-
-        } else if (curSt) {
-          // Render Active Spacecraft Sprite at simTimeSec
+        } else if (curSt && (lifecycle === "FLYING" || lifecycle === "ARRIVED")) {
+          // Render Spacecraft Sprite at curSt.position (Interpolated using rocket's own trajectory history)
           const s = worldToScreen(curSt.position[0], curSt.position[1], width, height);
           ctx.save();
           ctx.translate(s.x, s.y);
@@ -461,7 +458,8 @@ export const Sandbox2D: React.FC<Sandbox2DProps> = ({
           ctx.font = "9px 'JetBrains Mono', monospace";
           ctx.fillStyle = r.color;
           ctx.textAlign = "center";
-          ctx.fillText(r.name.toUpperCase(), 0, 18);
+          const labelText = lifecycle === "ARRIVED" ? `${r.name.toUpperCase()} (ARRIVED)` : r.name.toUpperCase();
+          ctx.fillText(labelText, 0, 18);
 
           ctx.font = "8px 'JetBrains Mono', monospace";
           ctx.fillStyle = "rgba(220, 220, 220, 0.85)";

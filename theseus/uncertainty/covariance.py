@@ -24,6 +24,29 @@ class CovarianceValidationError(ValueError):
     pass
 
 
+#: Default tolerance on the smallest eigenvalue of the *correlation* form
+#: D⁻¹PD⁻¹, where D = diag(sqrt(P_ii)).
+#:
+#: Dimensionless and invariant under a component-wise rescaling of the state,
+#: which the previous raw-eigenvalue tolerance was not.  Calibrated: 4 000
+#: exactly-singular correlation matrices (smallest eigenvalue zero by
+#: construction) produced no measured value below -1.22e-15, matching the
+#: backward-error bound eps·‖C‖₂ = 1.33e-15 for a 6×6; 35 genuine Phase 10
+#: covariances sampled from this repository sit no closer than +3.67e-06.
+PSD_CORRELATION_TOL = 1e-12
+
+#: Relative floor below which a negative diagonal entry is treated as roundoff
+#: rather than as an invalid variance, measured against the largest variance in
+#: the same block (position or velocity).
+#:
+#: Dimensionless by construction, so the verdict cannot depend on whether the
+#: caller works in metres or kilometres.  Same order as PSD_CORRELATION_TOL and
+#: justified the same way: forming P = Phi P0 Phi^T commits a backward error
+#: bounded by a small multiple of eps * ||P||, so a diagonal entry below this
+#: relative to its own block carries no information about sign.
+DIAGONAL_NOISE_RTOL = 1e-12
+
+
 @dataclass
 class StateCovariance:
     """
@@ -55,9 +78,24 @@ class StateCovariance:
     name : str
         Optional identifier for the tracked object.
     sym_tol : float
-        Relative tolerance for symmetry verification.
+        Relative tolerance for symmetry verification, applied to each entry
+        against its own scale sqrt(P_ii P_jj) — i.e. to the asymmetry of the
+        correlation matrix. Dimensionless.
     psd_tol : float
-        Absolute tolerance for negative eigenvalues due to floating-point precision.
+        Tolerance for negative eigenvalues due to floating-point precision,
+        applied to the **correlation form** D⁻¹PD⁻¹ rather than to the raw
+        matrix, so it is dimensionless and unchanged by a rescaling of the
+        state components.
+
+        Its default follows from measurement rather than preference: over 4 000
+        exactly-singular correlation matrices, whose smallest eigenvalue is zero
+        by construction, `eigvalsh` returned no value below -1.22e-15, in
+        agreement with the backward-error bound eps·‖C‖₂ = 1.33e-15 for a 6×6
+        correlation matrix. Genuine Phase 10 covariances measured in this
+        repository sit no closer to the boundary than +3.67e-06. A tolerance of
+        1e-12 therefore sits about 750× above the roundoff floor and about
+        3.7e6× below real data, so it can neither reject legitimate roundoff nor
+        admit a correlation exceeding unity by more than 1e-12.
     """
     matrix: np.ndarray
     epoch_s: float = 0.0
@@ -67,7 +105,7 @@ class StateCovariance:
     source: str = "USER_PROVIDED"
     name: Optional[str] = None
     sym_tol: float = 1e-7
-    psd_tol: float = 1e-9
+    psd_tol: float = PSD_CORRELATION_TOL
 
     def __post_init__(self) -> None:
         self.matrix = np.asarray(self.matrix, dtype=np.float64)
@@ -99,22 +137,61 @@ class StateCovariance:
             )
 
         # 3. Non-negative diagonal variances check
+        #
+        # The threshold used to be the literal -1e-15, which is an absolute
+        # value in whatever units the caller chose: m^2 for the position block,
+        # (m/s)^2 for the velocity block.  A variance is not dimensionless, so
+        # no absolute number can be right for both, and the same physical
+        # covariance changed verdict with the unit system.  Measured on one
+        # matrix with sigma_r = 10 m and a genuinely negative P[0,0] of
+        # -1e-18 sigma^2:
+        #
+        #     length unit  metres     P[0,0] = -1.0e-14  -> REJECTED
+        #     length unit  kilometres P[0,0] = -1.0e-20  -> accepted
+        #     length unit  megametres P[0,0] = -1.0e-26  -> accepted
+        #
+        # The same defect P10-10 removed from the collision-probability branch
+        # criteria and P10-11 removed from the PSD test, still present here.
+        #
+        # The scale that makes it dimensionless is the covariance's own: a
+        # diagonal entry is compared against the largest variance in its own
+        # block, which is what the correlation form does.  Roundoff in forming
+        # P = Phi P0 Phi^T is bounded by a small multiple of eps times the norm
+        # of the result, so DIAGONAL_NOISE_RTOL is the same order as the
+        # correlation-form PSD tolerance and justified the same way.
         diag = np.diag(self.matrix)
+        block_scale = self._diagonal_block_scales(diag)
         for i, val in enumerate(diag):
             var_name = ["rx", "ry", "rz", "vx", "vy", "vz"][i]
-            if val < -1e-15:
+            noise_floor = DIAGONAL_NOISE_RTOL * block_scale[i]
+            if val < -noise_floor:
                 raise CovarianceValidationError(
-                    f"COVARIANCE INVALID: Negative variance on diagonal for {var_name}: {val:.6e}"
+                    f"COVARIANCE INVALID: Negative variance on diagonal for "
+                    f"{var_name}: {val:.6e} "
+                    f"(more negative than {noise_floor:.6e}, which is "
+                    f"{DIAGONAL_NOISE_RTOL:.0e} of the largest variance in its "
+                    f"block, {block_scale[i]:.6e})"
                 )
             if val < 0.0:  # slight negative float noise
                 self.matrix[i, i] = 0.0
 
-        # 4. Symmetry check
-        max_abs = float(np.max(np.abs(self.matrix)))
-        scale = max(max_abs, 1.0)
-        asym = np.abs(self.matrix - self.matrix.T)
-        max_asym = float(np.max(asym))
-        rel_asym = max_asym / scale
+        # 4. Symmetry check, normalised per entry
+        #
+        # This used to be `max|P - P^T| / max(max|P|, 1.0)`.  The denominator is
+        # the largest entry of the whole 6x6, which for a state covariance is a
+        # position variance in m^2, while the numerator may be an asymmetry in
+        # the velocity block in (m/s)^2.  With sigma_r = 1 km and
+        # sigma_v = 1e-4 m/s that let an asymmetry of 10 000 % of the velocity
+        # variance pass, while at sigma_r = sigma_v = 1 a 1 % asymmetry was
+        # rejected -- the same physical defect judged differently according to
+        # an unrelated block's magnitude.
+        #
+        # Each entry is now compared against its own scale, sqrt(P_ii P_jj),
+        # which is the only quantity with the units of P_ij.  The result is the
+        # asymmetry of the correlation matrix, so `sym_tol` keeps its documented
+        # meaning of a *relative* tolerance and simply becomes relative to the
+        # right thing.
+        max_asym, rel_asym = self._normalised_asymmetry()
 
         if rel_asym > self.sym_tol:
             raise CovarianceValidationError(
@@ -125,23 +202,146 @@ class StateCovariance:
         # Explicitly symmetrize within tolerance to eliminate floating-point shear
         self.matrix = 0.5 * (self.matrix + self.matrix.T)
 
-        # 5. Positive semi-definiteness (eigenvalues >= -effective_psd_tol)
-        eigenvalues, eigvecs = np.linalg.eigh(self.matrix)
-        min_eig = float(np.min(eigenvalues))
-        effective_psd_tol = max(self.psd_tol, scale * 1e-9)
+        # 5. Positive semi-definiteness, tested in correlation form
+        #
+        # The previous test was `min_eig < -max(psd_tol, max(max|P|, 1.0) * 1e-9)`
+        # on the raw eigenvalues.  Positive semi-definiteness is invariant under
+        # congruence P -> S P S^T, so expressing the same physical covariance in
+        # different state units must not change the verdict -- but that test
+        # made it do exactly that.  Measured: a covariance with a correlation
+        # coefficient of 2.0 between r_x and v_x (impossible for any
+        # distribution) was accepted with sigma_r = 1 km, sigma_v = 1e-4 m/s,
+        # because the tolerance was 1e-3 m^2 while the offending eigenvalue was
+        # -3.0e-8.  The identical matrix in km and mm/s was rejected.  At
+        # sigma_r = 1 km the raw eigenvalue could not even be resolved: at a
+        # correlation of 1.00001 `eigh` returned +1.15e-11, positive, so no
+        # absolute tolerance however tight would have caught it.
+        #
+        # The test therefore runs on the correlation form C = D^-1 P D^-1,
+        # D = diag(sqrt(P_ii)).  D is nonsingular where the variances are
+        # positive, so C is PSD exactly when P is; C is dimensionless; and
+        # normalising by P's own diagonal introduces no scale from outside the
+        # matrix.  A zero variance is handled separately below, because
+        # Cauchy-Schwarz then forces the whole row to vanish.
+        self._reject_covariance_with_zero_variance()
+        min_corr_eig = self._correlation_min_eigenvalue()
 
-        if min_eig < -effective_psd_tol:
+        # Eigenvalues without eigenvectors: the raw spectrum is needed only to
+        # report alongside a rejection, and to decide whether the roundoff
+        # repair below has anything to do.  The eigenvectors are computed only
+        # if that repair actually runs.
+        min_eig = float(np.min(np.linalg.eigvalsh(self.matrix)))
+
+        if min_corr_eig < -self.psd_tol:
             raise CovarianceValidationError(
                 f"COVARIANCE INVALID: Matrix is not positive semi-definite. "
-                f"Negative eigenvalue detected: λ_min = {min_eig:.6e} (tolerance: {-effective_psd_tol:.6e})"
+                f"Negative eigenvalue detected: λ_min(correlation form) = "
+                f"{min_corr_eig:.6e} (tolerance: {-self.psd_tol:.6e}); "
+                f"λ_min(raw) = {min_eig:.6e}"
             )
-        
+
         # Eliminate tiny negative numerical roundoff within tolerance
         if min_eig < 0.0:
+            eigenvalues, eigvecs = np.linalg.eigh(self.matrix)
             eigenvalues = np.maximum(eigenvalues, 0.0)
             self.matrix = eigvecs @ np.diag(eigenvalues) @ eigvecs.T
             self.matrix = 0.5 * (self.matrix + self.matrix.T)
 
+
+    # -----------------------------------------------------------------------
+    # Dimensionless validity helpers
+    # -----------------------------------------------------------------------
+
+    @staticmethod
+    def _diagonal_block_scales(diag: np.ndarray) -> np.ndarray:
+        """
+        For each diagonal entry, the largest variance in its own block.
+
+        Position and velocity variances carry different units, so a single
+        scale for the whole 6x6 would reintroduce exactly the unit dependence
+        this replaces -- with sigma_r = 1 km and sigma_v = 1e-4 m/s the
+        position block is twenty orders of magnitude larger, and a velocity
+        variance would be compared against a position one.
+
+        A block whose variances are all zero or negative has no scale of its
+        own; the other block's is not meaningful for it either, so such an
+        entry falls back to a bare zero floor -- any negative value there is
+        reported rather than absorbed.
+        """
+        scales = np.zeros(6, dtype=np.float64)
+        for lo, hi in ((0, 3), (3, 6)):
+            block = np.asarray(diag[lo:hi], dtype=np.float64)
+            positive = block[block > 0.0]
+            scales[lo:hi] = float(np.max(positive)) if positive.size else 0.0
+        return scales
+
+    def _positive_variance_mask(self) -> np.ndarray:
+        """Indices whose variance is strictly positive, so a correlation exists."""
+        return np.diag(self.matrix) > 0.0
+
+    def _normalised_asymmetry(self) -> tuple[float, float]:
+        """
+        ``(max |P_ij - P_ji|, max |P_ij - P_ji| / sqrt(P_ii P_jj))``.
+
+        The second is the asymmetry of the correlation matrix: dimensionless,
+        and unchanged when the state is rescaled component-wise.
+        """
+        asym = np.abs(self.matrix - self.matrix.T)
+        max_asym = float(np.max(asym))
+
+        keep = self._positive_variance_mask()
+        if np.count_nonzero(keep) < 2:
+            return max_asym, 0.0 if max_asym == 0.0 else float("inf")
+
+        deviations = np.sqrt(np.diag(self.matrix)[keep])
+        normalised = asym[np.ix_(keep, keep)] / np.outer(deviations, deviations)
+        return max_asym, float(np.max(normalised))
+
+    def _reject_covariance_with_zero_variance(self) -> None:
+        """
+        A component with zero variance may not covary with anything.
+
+        Cauchy-Schwarz gives |P_ij|^2 <= P_ii P_jj, so P_ii = 0 forces P_ij = 0
+        for every j; any other value makes the matrix indefinite.  The bound is
+        exact and carries no tolerance, because the only quantity with the units
+        of P_ij here is sqrt(P_ii P_jj), which is zero.  The correlation form
+        cannot see this case -- the row has no correlation to normalise -- so it
+        is tested explicitly.
+        """
+        variances = np.diag(self.matrix)
+        for i in np.flatnonzero(variances <= 0.0):
+            row = np.abs(self.matrix[i]).copy()
+            row[i] = 0.0
+            worst = float(np.max(row))
+            if worst > 0.0:
+                name = ["rx", "ry", "rz", "vx", "vy", "vz"][int(i)]
+                partner = ["rx", "ry", "rz", "vx", "vy", "vz"][int(np.argmax(row))]
+                raise CovarianceValidationError(
+                    f"COVARIANCE INVALID: {name} has zero variance but covaries "
+                    f"with {partner} (P = {worst:.6e}). Cauchy-Schwarz requires "
+                    f"|P_ij|² ≤ P_ii P_jj = 0, so this matrix is not positive "
+                    f"semi-definite."
+                )
+
+    def _correlation_min_eigenvalue(self) -> float:
+        """
+        Smallest eigenvalue of the correlation form ``D⁻¹ P D⁻¹``.
+
+        Positive semi-definiteness is invariant under congruence by the
+        nonsingular diagonal ``D = diag(sqrt(P_ii))``, so this has the same sign
+        as the raw minimum eigenvalue in exact arithmetic — but it is
+        dimensionless, it is unchanged by rescaling the state components, and it
+        is resolvable in floating point when the blocks span many orders of
+        magnitude, which the raw eigenvalues are not.
+        """
+        keep = self._positive_variance_mask()
+        if not np.any(keep):
+            return 0.0
+
+        deviations = np.sqrt(np.diag(self.matrix)[keep])
+        correlation = self.matrix[np.ix_(keep, keep)] / np.outer(deviations, deviations)
+        correlation = 0.5 * (correlation + correlation.T)
+        return float(np.min(np.linalg.eigvalsh(correlation)))
 
     # -----------------------------------------------------------------------
     # Sub-block extractors

@@ -187,46 +187,63 @@ export const MissionSetupModal: React.FC<MissionSetupModalProps> = ({
             <div className="bg-[#050505] p-3 rounded border border-[#1c1c1c] space-y-3">
               
               <div>
-                <label className="block text-[#888888] text-[10px] mb-1 font-semibold">SELECT VEHICLE / STAGE PRESET</label>
-                <div className="grid grid-cols-1 md:grid-cols-2 gap-2 max-h-36 overflow-y-auto pr-1">
+                <label className="block text-[#888888] text-[10px] mb-1.5 font-semibold tracking-wider uppercase">
+                  SELECT VEHICLE ARCHITECTURE / PROPULSION STAGE
+                </label>
+                <div className="grid grid-cols-1 md:grid-cols-2 gap-2 max-h-48 overflow-y-auto pr-1">
                   {ROCKET_PRESETS.map((p) => (
                     <button
                       type="button"
                       key={p.id}
                       onClick={() => setSelectedPresetId(p.id)}
-                      className={`p-2 rounded text-left border text-xs transition-all flex justify-between items-center ${
+                      className={`p-2.5 rounded text-left border text-xs transition-all flex items-center justify-between cursor-pointer ${
                         selectedPresetId === p.id
-                          ? "bg-[#ff9900]/15 border-[#ff9900] text-[#ffffff]"
-                          : "bg-[#0d0d0d] border-[#222222] text-[#aaaaaa] hover:border-[#333333]"
+                          ? "bg-[#ff9900]/15 border-[#ff9900] text-[#ffffff] shadow-md"
+                          : "bg-[#0d0d0d] border-[#222222] text-[#aaaaaa] hover:border-[#444444]"
                       }`}
                     >
-                      <div>
-                        <div className="font-bold text-[11px] text-[#ff9900] truncate">{p.name}</div>
-                        <div className="text-[9px] text-[#777777]">{p.category} • {p.operator}</div>
+                      <div className="flex items-center space-x-2.5">
+                        <div className={`w-7 h-7 rounded flex items-center justify-center font-bold text-[10px] ${
+                          selectedPresetId === p.id ? "bg-[#ff9900] text-black" : "bg-neutral-800 text-neutral-300"
+                        }`}>
+                          <Rocket className="w-4 h-4" />
+                        </div>
+                        <div>
+                          <div className="font-bold text-[11px] text-[#ffffff] flex items-center gap-1.5">
+                            <span>{p.name}</span>
+                            <span className="text-[9px] px-1 py-0.2 bg-neutral-900 border border-neutral-700 text-amber-400 font-semibold rounded">
+                              {p.operator || "REAL"}
+                            </span>
+                          </div>
+                          <div className="text-[9.5px] text-[#888888]">{p.category}</div>
+                        </div>
                       </div>
-                      <span className="text-[10px] text-[#44bb66] font-bold">Isp {p.specific_impulse_s}s</span>
+                      <div className="text-right">
+                        <div className="text-[10px] text-[#44bb66] font-bold">Isp {p.specific_impulse_s}s</div>
+                        <div className="text-[9px] text-[#666666]">{(p.max_thrust_n / 1000).toFixed(0)} kN</div>
+                      </div>
                     </button>
                   ))}
                 </div>
               </div>
 
-              {/* Selected Vehicle Specs */}
-              <div className="grid grid-cols-2 md:grid-cols-4 gap-2 text-[10px] bg-[#0d0d0d] p-2.5 rounded border border-[#1f1f1f]">
+              {/* Selected Vehicle Technical Details & Provenance */}
+              <div className="grid grid-cols-2 md:grid-cols-4 gap-2 text-[10px] bg-[#0d0d0d] p-3 rounded border border-[#1f1f1f]">
                 <div>
-                  <span className="text-[#777777]">DRY MASS:</span>
-                  <div className="text-[#f0eee9] font-bold">{selectedPreset.dry_mass_kg.toLocaleString()} kg</div>
+                  <span className="text-[#777777] block text-[9px]">VEHICLE DRY MASS:</span>
+                  <div className="text-[#f0eee9] font-bold text-xs">{selectedPreset.dry_mass_kg.toLocaleString()} kg</div>
                 </div>
                 <div>
-                  <span className="text-[#777777]">PROPELLANT LOAD:</span>
-                  <div className="text-[#ff9900] font-bold">{selectedPreset.propellant_mass_kg.toLocaleString()} kg</div>
+                  <span className="text-[#777777] block text-[9px]">MAX PROPELLANT LOAD:</span>
+                  <div className="text-[#ff9900] font-bold text-xs">{selectedPreset.propellant_mass_kg.toLocaleString()} kg</div>
                 </div>
                 <div>
-                  <span className="text-[#777777]">SPECIFIC IMPULSE:</span>
-                  <div className="text-[#44bb66] font-bold">{selectedPreset.specific_impulse_s} s</div>
+                  <span className="text-[#777777] block text-[9px]">VACUUM SPECIFIC IMPULSE:</span>
+                  <div className="text-[#44bb66] font-bold text-xs">{selectedPreset.specific_impulse_s} s</div>
                 </div>
                 <div>
-                  <span className="text-[#777777]">MAX THRUST:</span>
-                  <div className="text-[#cccccc] font-bold">{(selectedPreset.max_thrust_n / 1000).toFixed(1)} kN</div>
+                  <span className="text-[#777777] block text-[9px]">MAXIMUM THRUST:</span>
+                  <div className="text-[#cccccc] font-bold text-xs">{(selectedPreset.max_thrust_n / 1000).toFixed(1)} kN</div>
                 </div>
               </div>
 

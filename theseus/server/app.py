@@ -13,9 +13,10 @@ from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 import numpy as np
 
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, Field
+from fastapi.responses import JSONResponse
+from pydantic import BaseModel, Field, model_validator
 
 # THESEUS Engine Modules
 from theseus.constants.physical import (
@@ -57,8 +58,11 @@ from theseus.reentry.simulator import ReentrySimulator
 from theseus.reentry.heating import heating_model_metadata
 
 # Phase 9 — Conjunction Analysis
+from theseus.orbital.circular import CircularOrbitStates, circular_orbit_from_altitude
 from theseus.conjunction.analysis import ConjunctionAnalysis
 from theseus.conjunction.screening import ConjunctionScreener
+from fastapi.exceptions import RequestValidationError
+from theseus.conjunction.state_validation import NonFiniteStateError
 
 # Phase 10 — Uncertainty & Probability of Collision
 from theseus.uncertainty.covariance import StateCovariance
@@ -71,6 +75,7 @@ from theseus.simulation.multi_object import (
     SpacecraftDefinition,
     MultiObjectEnvironment,
     MultiObjectSimulationResult,
+    SolarRadiationPressureUnavailable,
 )
 
 
@@ -88,6 +93,150 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+@app.exception_handler(NonFiniteStateError)
+async def _non_finite_state_handler(request: Request, exc: NonFiniteStateError) -> JSONResponse:
+    """
+    Report a non-finite trajectory state as an explicit, diagnosable failure.
+
+    Without this handler the engine's ``NonFiniteStateError`` would surface as
+    an unqualified 500, which reads as "the server is broken" rather than "the
+    state you supplied cannot be analysed".  The response carries the full
+    diagnostic -- object, quantity, time, offending components -- so a client
+    can say exactly what was wrong.
+
+    422 rather than 400: the request was well-formed and passed schema
+    validation; it is the *content* of the resulting trajectory that cannot be
+    processed.
+
+    This never converts a failure into a result.  There is deliberately no
+    conjunction payload in the response body: a non-finite state has no
+    analysis, not an empty one.
+    """
+    payload = exc.to_dict()
+    payload["detail"] = str(exc)
+    return JSONResponse(status_code=422, content=payload)
+
+
+class FiniteFieldsModel(BaseModel):
+    """
+    A request model whose float fields must be finite.
+
+    B-2 established that a non-finite state must never produce zero
+    conjunctions or another valid-looking negative result, and guarded the
+    ORBIT-X analysis boundary.  The API boundary was left open, and JSON
+    permits the non-standard literals ``NaN``, ``Infinity`` and ``-Infinity``,
+    which Python's parser accepts and Pydantic passes straight through to a
+    ``float`` field.  Measured before this guard existed:
+
+        object_a_alt_km        = NaN        -> HTTP 500 Internal Server Error
+        object_a_inc_deg       = Infinity   -> HTTP 500 Internal Server Error
+        screening_threshold_km = NaN        -> HTTP 200, "events": []
+        analysis_duration_hours= -Infinity  -> HTTP 200, "events": []
+
+    The last two are the dangerous ones and are precisely what B-2 forbade: a
+    non-finite input returning a successful analysis reporting no conjunctions.
+    The 500s are merely undiagnosable.
+
+    Both are now a 422 naming the offending field, consistent with the
+    ``NonFiniteStateError`` handler above, and carrying no analysis payload --
+    a non-finite request has no analysis, not an empty one.
+    """
+
+    @model_validator(mode="after")
+    def _reject_non_finite_fields(self):
+        offenders = []
+        for name, value in self.__dict__.items():
+            for label, number in _iter_floats(name, value):
+                if not math.isfinite(number):
+                    offenders.append({"field": label, "value": repr(number)})
+        if offenders:
+            raise NonFiniteRequestError(offenders)
+        return self
+
+
+class NonFiniteRequestError(ValueError):
+    """A request field that must be a finite number was NaN or infinite."""
+
+    def __init__(self, offenders: list[dict]) -> None:
+        listed = ", ".join(f"{o['field']}={o['value']}" for o in offenders)
+        super().__init__(
+            f"REQUEST INVALID: non-finite value(s) in numeric field(s): {listed}. "
+            f"A non-finite input cannot produce an analysis, empty or otherwise."
+        )
+        self.offenders = offenders
+
+
+def _iter_floats(prefix: str, value: Any):
+    """Yield every float reachable from a request field, with a dotted label."""
+    if isinstance(value, bool):
+        return
+    if isinstance(value, float):
+        yield prefix, value
+    elif isinstance(value, (list, tuple)):
+        for index, item in enumerate(value):
+            yield from _iter_floats(f"{prefix}[{index}]", item)
+    elif isinstance(value, dict):
+        for key, item in value.items():
+            yield from _iter_floats(f"{prefix}.{key}", item)
+    elif isinstance(value, BaseModel):
+        for key, item in value.__dict__.items():
+            yield from _iter_floats(f"{prefix}.{key}", item)
+
+
+@app.exception_handler(SolarRadiationPressureUnavailable)
+async def _srp_unavailable_handler(request: Request,
+                                   exc: SolarRadiationPressureUnavailable) -> JSONResponse:
+    """
+    501 rather than 500: the request was valid and the server is working; the
+    feature it asked for is not implemented.  It used to be a bare 500 from a
+    TypeError deep in force-model assembly.
+    """
+    return JSONResponse(status_code=501, content={
+        "error": "SOLAR_RADIATION_PRESSURE_UNAVAILABLE",
+        "detail": str(exc),
+    })
+
+
+def _json_safe(value: Any) -> Any:
+    """
+    Replace anything JSON cannot represent with a string form of itself.
+
+    FastAPI echoes the rejected input back inside its 422 body.  When the
+    rejected input is the NaN that caused the rejection, encoding that body
+    fails and the 422 becomes a 500 -- so the guard above fired correctly and
+    the caller still saw "Internal Server Error".  Sanitising the echo is what
+    lets the diagnostic actually reach them.
+    """
+    if isinstance(value, float):
+        return value if math.isfinite(value) else repr(value)
+    if isinstance(value, dict):
+        return {str(k): _json_safe(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_safe(v) for v in value]
+    if isinstance(value, (str, int, bool)) or value is None:
+        return value
+    return str(value)
+
+
+@app.exception_handler(RequestValidationError)
+async def _request_validation_handler(request: Request,
+                                      exc: RequestValidationError) -> JSONResponse:
+    """
+    Schema-validation failures, with the non-finite case named explicitly.
+
+    Everything else keeps FastAPI's ordinary 422 shape; only the echoed input
+    is made encodable.
+    """
+    errors = _json_safe(exc.errors())
+    non_finite = [e for e in errors
+                  if "REQUEST INVALID: non-finite" in str(e.get("msg", ""))]
+    payload: dict[str, Any] = {"detail": errors}
+    if non_finite:
+        payload["error"] = "NON_FINITE_REQUEST_FIELD"
+        payload["message"] = str(non_finite[0].get("msg", ""))
+    return JSONResponse(status_code=422, content=payload)
+
 
 simple_ephemeris = SimpleEphemerisProvider()
 astropy_ephemeris = AstropyEphemerisProvider()
@@ -176,7 +325,7 @@ def _health_check_subsystems() -> dict[str, str]:
 # Request / Response Schemas
 # ---------------------------------------------------------------------------
 
-class HohmannRequest(BaseModel):
+class HohmannRequest(FiniteFieldsModel):
     r1_km: float = Field(6678.137, description="Initial orbit radius (km)")
     r2_km: float = Field(42164.0, description="Target orbit radius (km)")
     origin_body: str = Field("Earth", description="Central celestial body name")
@@ -187,7 +336,7 @@ class HohmannRequest(BaseModel):
     thrust_n: float = Field(500.0, description="Engine thrust (N)")
 
 
-class LambertRequest(BaseModel):
+class LambertRequest(FiniteFieldsModel):
     r1_km: List[float] = Field(default_factory=lambda: [149597870.7, 0.0, 0.0])
     r2_km: List[float] = Field(default_factory=lambda: [0.0, 227939200.0, 0.0])
     tof_hours: float = Field(6240.0, description="Transfer time-of-flight (hours)")
@@ -202,7 +351,19 @@ class LambertRequest(BaseModel):
     epoch_jd: float = Field(JD_J2000, description="Departure epoch as Julian Date")
 
 
-class RendezvousRequest(BaseModel):
+class InterceptRequest(FiniteFieldsModel):
+    origin_body: str = Field("Earth", description="Departure planet for interceptor rocket")
+    target_state_history: List[Dict[str, Any]] = Field(..., description="Target rocket trajectory state samples")
+    central_body: str = Field("Sun")
+    dry_mass_kg: float = Field(2500.0)
+    fuel_mass_kg: float = Field(5000.0)
+    specific_impulse_s: float = Field(325.0)
+    thrust_n: float = Field(500000.0)
+    epoch_jd: float = Field(JD_J2000)
+    min_future_time_s: float = Field(86400.0, description="Minimum future intercept time in seconds")
+
+
+class RendezvousRequest(FiniteFieldsModel):
     chaser_alt_km: float = Field(400.0, description="Chaser altitude (km)")
     target_alt_km: float = Field(420.0, description="Target altitude (km)")
     target_lead_deg: float = Field(60.0, description="Target phase lead angle (deg)")
@@ -214,7 +375,7 @@ class RendezvousRequest(BaseModel):
     thrust_n: float = Field(200.0)
 
 
-class PropagationRequest(BaseModel):
+class PropagationRequest(FiniteFieldsModel):
     r0_km: List[float] = Field(default_factory=lambda: [6778.137, 0.0, 0.0])
     v0_km_s: List[float] = Field(default_factory=lambda: [0.0, 7.668, 0.0])
     duration_hours: float = Field(3.0, description="Propagation duration (hours)")
@@ -927,6 +1088,86 @@ def simulate_lambert(req: LambertRequest) -> Dict[str, Any]:
     }
 
 
+@app.post("/api/simulate/intercept")
+def simulate_intercept(req: InterceptRequest) -> Dict[str, Any]:
+    """Calculate an intentional future intercept trajectory targeting a moving rocket's future position."""
+    body = get_body(req.central_body)
+
+    # 1. Obtain departure position of interceptor rocket at epoch
+    r1, _ = _safe_ephemeris_state(req.origin_body, req.epoch_jd, heliocentric=True)
+
+    # 2. Filter target rocket future state history beyond minimum future time threshold (prevent t=0 launch overlap)
+    future_candidates = [
+        st for st in req.target_state_history
+        if st.get("time_seconds", 0.0) >= req.min_future_time_s
+    ]
+
+    if not future_candidates:
+        raise HTTPException(
+            status_code=400,
+            detail="NO VALID INTERCEPT FOUND: Target rocket has no future trajectory samples beyond launch threshold."
+        )
+
+    # 3. Sample candidate future intercept times along target rocket trajectory
+    step = max(1, len(future_candidates) // 25)
+    sampled_candidates = future_candidates[::step]
+
+    best_result = None
+    best_dv = float("inf")
+    INTERCEPT_TOLERANCE_M = 5.0e9
+
+    for cand in sampled_candidates:
+        t_arr = float(cand["time_seconds"])
+        r_target_m = np.array(cand["position"], dtype=float)
+        r_target_km = (r_target_m / 1e3).tolist()
+        r1_km = (r1 / 1e3).tolist()
+        tof_hours = t_arr / 3600.0
+
+        if tof_hours <= 0.1:
+            continue
+
+        try:
+            lam_req = LambertRequest(
+                r1_km=r1_km,
+                r2_km=r_target_km,
+                tof_hours=tof_hours,
+                central_body=req.central_body,
+                prograde=True,
+                dry_mass_kg=req.dry_mass_kg,
+                fuel_mass_kg=req.fuel_mass_kg,
+                specific_impulse_s=req.specific_impulse_s,
+                thrust_n=req.thrust_n,
+                origin_body=req.origin_body,
+                destination_body=None,
+                epoch_jd=req.epoch_jd,
+            )
+            res = simulate_lambert(lam_req)
+            if res and res.get("metadata", {}).get("status") == "SUCCESS":
+                sc_final_pos = np.array(res["state_history"][-1]["position"])
+                endpoint_miss_m = float(np.linalg.norm(sc_final_pos - r_target_m))
+                if endpoint_miss_m < INTERCEPT_TOLERANCE_M:
+                    tot_dv = res.get("delta_v_budget", {}).get("total_delta_v", float("inf"))
+                    avail_dv = res.get("delta_v_budget", {}).get("available_delta_v", 0.0)
+                    if tot_dv <= avail_dv and tot_dv < best_dv:
+                        best_dv = tot_dv
+                        best_result = res
+        except Exception:
+            continue
+
+    if not best_result:
+        raise HTTPException(
+            status_code=400,
+            detail="NO VALID INTERCEPT FOUND: No physically feasible transfer arc intercepts target rocket within vehicle propellant limits."
+        )
+
+    best_result["metadata"]["name"] = f"{req.origin_body} → Target Intercept Mission"
+    t_intercept_s = best_result["state_history"][-1]["time_seconds"]
+    sc_pos = best_result["state_history"][-1]["position"]
+    print(f"[INTERCEPT CALCULATED] Departure: {req.origin_body} | Intercept Time T: {t_intercept_s:.1f} s ({t_intercept_s/86400.0:.2f} days) | Intercept Position: [{sc_pos[0]:,.1f}, {sc_pos[1]:,.1f}, {sc_pos[2]:,.1f}] m")
+
+    return best_result
+
+
 @app.post("/api/simulate/rendezvous")
 def simulate_rendezvous(req: RendezvousRequest) -> Dict[str, Any]:
     """Solve orbital rendezvous relative motion and target interception."""
@@ -1162,7 +1403,7 @@ def get_demo_mission(demo_id: str) -> Dict[str, Any]:
 # Phase 8 — Reentry Dynamics
 # ---------------------------------------------------------------------------
 
-class ReentryRequest(BaseModel):
+class ReentryRequest(FiniteFieldsModel):
     entry_altitude_km: float = Field(120.0, description="Entry altitude above surface (km)")
     entry_velocity_km_s: float = Field(7.8, description="Entry speed (km/s)")
     entry_fpa_deg: float = Field(-3.0, description="Entry flight-path angle (deg, negative=descending)")
@@ -1238,7 +1479,7 @@ def simulate_reentry(req: ReentryRequest) -> Dict[str, Any]:
 # Phase 9 — Conjunction / Collision Analysis
 # ---------------------------------------------------------------------------
 
-class ConjunctionRequest(BaseModel):
+class ConjunctionRequest(FiniteFieldsModel):
     """Two objects defined by initial circular-orbit parameters."""
     object_a_alt_km: float = Field(400.0, description="Object A orbital altitude (km)")
     object_a_inc_deg: float = Field(51.6, description="Object A inclination (deg)")
@@ -1252,52 +1493,64 @@ class ConjunctionRequest(BaseModel):
     coarse_dt_s: float = Field(30.0, description="Coarse screening time step (s)")
 
 
+def _conjunction_orbit_pair(req, body) -> tuple[CircularOrbitStates, CircularOrbitStates]:
+    """
+    Convert a conjunction request's orbital fields into ORBIT-X orbit objects.
+
+    This is the API's only job here: unit conversion and validation.  The
+    orbital mechanics -- the rotation from orbital elements into inertial
+    coordinates, and the advance of true anomaly with time -- belongs to
+    :class:`theseus.orbital.circular.CircularOrbitStates` and is not
+    reimplemented at this boundary.
+
+    Conventions carried by the request schema, made explicit here:
+
+    - ``*_alt_km`` is altitude in kilometres above the central body's mean
+      equatorial radius; the orbit radius is ``body.radius + altitude``.
+      It is a spherical-body altitude, not a geodetic one.
+    - ``*_inc_deg`` is inclination in degrees.
+    - ``*_phase_deg`` is the true anomaly at t = 0, in degrees, measured from
+      the ascending node.  Eccentricity is zero and argument of periapsis is
+      undefined, hence fixed at zero.
+    - RAAN is **fixed at zero for both objects**: the request schema exposes no
+      node parameter, so both orbits share an ascending node along +x. Two
+      objects of differing inclination therefore cross on the x axis, which is
+      what produces node conjunctions in these endpoints. This has always been
+      the behaviour; it is now stated rather than implied.
+    - The epoch is t = 0 at the start of the analysis window, and all times in
+      the response are seconds from that epoch.
+    - States are inertial (ECI/ICRF) in metres and metres per second.
+    """
+    return (
+        circular_orbit_from_altitude(
+            altitude_m=req.object_a_alt_km * 1e3,
+            body_radius_m=body.radius,
+            inclination_rad=math.radians(req.object_a_inc_deg),
+            phase_rad=math.radians(req.object_a_phase_deg),
+            mu=body.mu,
+            raan_rad=0.0,
+            epoch_s=0.0,
+        ),
+        circular_orbit_from_altitude(
+            altitude_m=req.object_b_alt_km * 1e3,
+            body_radius_m=body.radius,
+            inclination_rad=math.radians(req.object_b_inc_deg),
+            phase_rad=math.radians(req.object_b_phase_deg),
+            mu=body.mu,
+            raan_rad=0.0,
+            epoch_s=0.0,
+        ),
+    )
+
+
 @app.post("/api/simulate/conjunction")
 def simulate_conjunction(req: ConjunctionRequest) -> Dict[str, Any]:
     """Run conjunction analysis between two objects with full calculation trace."""
     body = get_body(req.central_body)
-    mu = body.mu
-    R = body.radius
 
-    r_a = R + req.object_a_alt_km * 1e3
-    r_b = R + req.object_b_alt_km * 1e3
-    inc_a = math.radians(req.object_a_inc_deg)
-    inc_b = math.radians(req.object_b_inc_deg)
-    phase_a = math.radians(req.object_a_phase_deg)
-    phase_b = math.radians(req.object_b_phase_deg)
-
-    n_a = math.sqrt(mu / r_a ** 3)
-    n_b = math.sqrt(mu / r_b ** 3)
-    v_a_circ = math.sqrt(mu / r_a)
-    v_b_circ = math.sqrt(mu / r_b)
-
-    def pos_a(t):
-        theta = n_a * t + phase_a
-        x = r_a * math.cos(theta)
-        y = r_a * math.sin(theta) * math.cos(inc_a)
-        z = r_a * math.sin(theta) * math.sin(inc_a)
-        return np.array([x, y, z])
-
-    def vel_a(t):
-        theta = n_a * t + phase_a
-        vx = -v_a_circ * math.sin(theta)
-        vy = v_a_circ * math.cos(theta) * math.cos(inc_a)
-        vz = v_a_circ * math.cos(theta) * math.sin(inc_a)
-        return np.array([vx, vy, vz])
-
-    def pos_b(t):
-        theta = n_b * t + phase_b
-        x = r_b * math.cos(theta)
-        y = r_b * math.sin(theta) * math.cos(inc_b)
-        z = r_b * math.sin(theta) * math.sin(inc_b)
-        return np.array([x, y, z])
-
-    def vel_b(t):
-        theta = n_b * t + phase_b
-        vx = -v_b_circ * math.sin(theta)
-        vy = v_b_circ * math.cos(theta) * math.cos(inc_b)
-        vz = v_b_circ * math.cos(theta) * math.sin(inc_b)
-        return np.array([vx, vy, vz])
+    orbit_a, orbit_b = _conjunction_orbit_pair(req, body)
+    pos_a, vel_a = orbit_a.as_callables()
+    pos_b, vel_b = orbit_b.as_callables()
 
     t_end = req.analysis_duration_hours * 3600.0
 
@@ -1314,7 +1567,7 @@ def simulate_conjunction(req: ConjunctionRequest) -> Dict[str, Any]:
 # Phase 10 — Uncertainty Propagation & Probability of Collision
 # ---------------------------------------------------------------------------
 
-class CovarianceInput(BaseModel):
+class CovarianceInput(FiniteFieldsModel):
     sigma_pos_km: Optional[List[float]] = Field(default_factory=lambda: [1.0, 1.0, 1.0], description="Position 1-sigma [x, y, z] (km)")
     sigma_vel_km_s: Optional[List[float]] = Field(default_factory=lambda: [0.001, 0.001, 0.001], description="Velocity 1-sigma [vx, vy, vz] (km/s)")
     matrix_si: Optional[List[List[float]]] = Field(None, description="Direct 6×6 SI covariance matrix (m², m²/s²)")
@@ -1322,7 +1575,7 @@ class CovarianceInput(BaseModel):
     source: str = Field("USER_PROVIDED", description="Provenance of covariance")
 
 
-class ConjunctionRiskRequest(BaseModel):
+class ConjunctionRiskRequest(FiniteFieldsModel):
     object_a_alt_km: float = Field(400.0, description="Object A orbital altitude (km)")
     object_a_inc_deg: float = Field(51.6, description="Object A inclination (deg)")
     object_a_phase_deg: float = Field(0.0, description="Object A initial phase angle (deg)")
@@ -1346,48 +1599,12 @@ def simulate_conjunction_risk(req: ConjunctionRiskRequest) -> Dict[str, Any]:
     """Run full Phase 10 uncertainty propagation, B-plane covariance, Pc, and risk classification."""
     body = get_body(req.central_body)
     mu = body.mu
-    R = body.radius
+    R = body.radius          # J2 reference radius for covariance propagation
     j2 = body.J2 if body.J2 else 0.0
 
-    r_a = R + req.object_a_alt_km * 1e3
-    r_b = R + req.object_b_alt_km * 1e3
-    inc_a = math.radians(req.object_a_inc_deg)
-    inc_b = math.radians(req.object_b_inc_deg)
-    phase_a = math.radians(req.object_a_phase_deg)
-    phase_b = math.radians(req.object_b_phase_deg)
-
-    n_a = math.sqrt(mu / r_a ** 3)
-    n_b = math.sqrt(mu / r_b ** 3)
-    v_a_circ = math.sqrt(mu / r_a)
-    v_b_circ = math.sqrt(mu / r_b)
-
-    def pos_a(t):
-        theta = n_a * t + phase_a
-        x = r_a * math.cos(theta)
-        y = r_a * math.sin(theta) * math.cos(inc_a)
-        z = r_a * math.sin(theta) * math.sin(inc_a)
-        return np.array([x, y, z])
-
-    def vel_a(t):
-        theta = n_a * t + phase_a
-        vx = -v_a_circ * math.sin(theta)
-        vy = v_a_circ * math.cos(theta) * math.cos(inc_a)
-        vz = v_a_circ * math.cos(theta) * math.sin(inc_a)
-        return np.array([vx, vy, vz])
-
-    def pos_b(t):
-        theta = n_b * t + phase_b
-        x = r_b * math.cos(theta)
-        y = r_b * math.sin(theta) * math.cos(inc_b)
-        z = r_b * math.sin(theta) * math.sin(inc_b)
-        return np.array([x, y, z])
-
-    def vel_b(t):
-        theta = n_b * t + phase_b
-        vx = -v_b_circ * math.sin(theta)
-        vy = v_b_circ * math.cos(theta) * math.cos(inc_b)
-        vz = v_b_circ * math.cos(theta) * math.sin(inc_b)
-        return np.array([vx, vy, vz])
+    orbit_a, orbit_b = _conjunction_orbit_pair(req, body)
+    pos_a, vel_a = orbit_a.as_callables()
+    pos_b, vel_b = orbit_b.as_callables()
 
     # Construct initial covariances
     if req.cov_a is not None and req.cov_a.matrix_si is not None:
@@ -1453,7 +1670,7 @@ def simulate_uncertainty_alias(req: ConjunctionRiskRequest) -> Dict[str, Any]:
 # Multi-Spacecraft Environment Simulation API
 # ---------------------------------------------------------------------------
 
-class SpacecraftInput(BaseModel):
+class SpacecraftInput(FiniteFieldsModel):
     id: str = Field("SC-01", description="Unique spacecraft identifier")
     name: str = Field("Explorer-01", description="Display name")
     vehicle_type: str = Field("falcon9", description="Vehicle preset or type")
@@ -1485,7 +1702,7 @@ class SpacecraftInput(BaseModel):
     sigma_vel_m_s: Optional[List[float]] = Field(default_factory=lambda: [0.1, 0.1, 0.1], description="1-sigma velocity uncertainty (m/s)")
 
 
-class MultiSimulationRequest(BaseModel):
+class MultiSimulationRequest(FiniteFieldsModel):
     spacecraft: List[SpacecraftInput] = Field(default_factory=list, description="List of spacecraft configurations")
     central_body: str = Field("Earth", description="Central celestial body")
     duration_hours: Optional[float] = Field(None, description="Simulation duration (hours). Auto-calculated if None.")

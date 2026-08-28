@@ -18,40 +18,12 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any, Optional
 
-
-@dataclass
-class CollisionGeometry:
-    """
-    Collision geometry model for a single space object.
-
-    Attributes
-    ----------
-    name : str
-        Object name or identifier.
-    physical_radius_m : float
-        Nominal body radius (m).
-    collision_radius_m : float
-        Effective hard-body collision radius (m) enclosing appendages.
-    object_type : str
-        'payload', 'rocket_body', 'debris', 'generic'.
-    shape : str
-        'spherical', 'box_wing', 'cylinder'.
-    """
-    name: str = "Generic Object"
-    physical_radius_m: float = 1.0
-    collision_radius_m: float = 1.0
-    object_type: str = "generic"
-    shape: str = "spherical"
-
-    def __post_init__(self) -> None:
-        if self.physical_radius_m < 0.0:
-            raise ValueError(f"Physical radius must be non-negative, got {self.physical_radius_m}")
-        if self.collision_radius_m < 0.0:
-            raise ValueError(f"Collision radius must be non-negative, got {self.collision_radius_m}")
-        if self.collision_radius_m < self.physical_radius_m:
-            raise ValueError(
-                f"Collision radius ({self.collision_radius_m} m) cannot be smaller than physical radius ({self.physical_radius_m} m)"
-            )
+# CollisionGeometry describes an object's *deterministic* physical dimensions,
+# which is a Phase 9 concept, so it now lives with the rest of the conjunction
+# geometry.  It is re-exported here so that Phase 10 code and any existing
+# `from theseus.uncertainty.hard_body import CollisionGeometry` keep working.
+# Phase 10 layers the probabilistic hard-body *disk radius* on top of it.
+from theseus.conjunction.geometry import CollisionGeometry  # noqa: F401
 
 
 # Common reference presets
@@ -164,7 +136,9 @@ def compute_hard_body_radius(
     obj_a : CollisionGeometry, optional
     obj_b : CollisionGeometry, optional
     custom_hbr_m : float, optional
-        Directly specified combined HBR.
+        Directly specified **combined** HBR, i.e. R_A + R_B for the pair, not
+        a per-object radius.  Any non-negative value is accepted, including
+        values below one metre and zero.
     radius_a_m : float, optional
         Collision radius for object A.
     radius_b_m : float, optional
@@ -173,12 +147,71 @@ def compute_hard_body_radius(
     Returns
     -------
     HardBodyResult
+        ``combined_hbr_m`` is the quantity the collision-probability
+        integration uses.  On the ``custom_hbr_m`` path it equals the supplied
+        value exactly; the two per-object geometries carry an equal split of
+        it, marked as derived in their ``source``.
+
+    Raises
+    ------
+    ValueError
+        If ``custom_hbr_m`` is negative, or if a supplied geometry is itself
+        internally inconsistent.
+
+    Notes
+    -----
+    **Precedence, pre-existing and unchanged:** when ``custom_hbr_m`` is not
+    None it takes priority and ``obj_a``/``obj_b`` are ignored entirely.  A
+    caller that supplies both real geometries *and* a combined HBR gets the
+    combined HBR.  This is stated here rather than left implicit; whether the
+    precedence is the right one is a separate question from this function's
+    correctness and has not been changed.
     """
     if custom_hbr_m is not None:
         if custom_hbr_m < 0.0:
             raise ValueError(f"Custom HBR must be non-negative, got {custom_hbr_m}")
-        geom_a = CollisionGeometry(name="Object A", collision_radius_m=custom_hbr_m / 2.0)
-        geom_b = CollisionGeometry(name="Object B", collision_radius_m=custom_hbr_m / 2.0)
+
+        # A caller-supplied combined HBR carries no per-object information: it
+        # is one number for the pair.  The two geometries below exist only so
+        # the result can report a consistent pair; the equal split is a
+        # reporting convention and nothing downstream uses it -- the collision
+        # probability integrates over a disk of radius `combined_hbr_m`, which
+        # is the supplied value exactly, whatever the split.
+        #
+        # `physical_radius_m` must therefore be derived from the supplied
+        # number too, not left at the dataclass default.  Leaving it at 1.0 m
+        # was the defect: for any combined HBR below 2 m the derived collision
+        # radius falls under that fixed default and the geometry's own
+        # consistency check -- collision radius may not be smaller than
+        # physical radius -- rejects a perfectly valid request.  Every CubeSat,
+        # small-debris and fragment conjunction was unanalysable because of a
+        # placeholder, and for HBR >= 2 m the reported 1.0 m was a fabricated
+        # structural dimension that no caller had supplied.
+        #
+        # A supplied combined HBR is by definition an enclosing radius: it
+        # already includes appendages, so there is no separate structural
+        # figure to distinguish.  The structural radius is therefore set equal
+        # to the collision radius rather than invented below it, and `source`
+        # records that both are derived, not measured.
+        half_hbr = custom_hbr_m / 2.0
+        provenance = (
+            f"Derived from a caller-supplied combined hard-body radius of "
+            f"{custom_hbr_m} m, split equally between the two objects. "
+            f"Neither object's individual dimensions are known; only the sum "
+            f"is physically meaningful."
+        )
+        geom_a = CollisionGeometry(
+            name="Object A",
+            collision_radius_m=half_hbr,
+            physical_radius_m=half_hbr,
+            source=provenance,
+        )
+        geom_b = CollisionGeometry(
+            name="Object B",
+            collision_radius_m=half_hbr,
+            physical_radius_m=half_hbr,
+            source=provenance,
+        )
         return HardBodyResult(combined_hbr_m=custom_hbr_m, object_a=geom_a, object_b=geom_b)
 
     geom_a = obj_a or CollisionGeometry(

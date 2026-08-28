@@ -6,6 +6,8 @@ export interface InterpolatedRocketState {
   velocity: [number, number, number];
   speed: number;
   altitude: number;
+  /** Total vehicle mass in kg, carried through from the ORBIT-X state. */
+  mass: number;
   fuel_mass: number;
   thrust_active: boolean;
 }
@@ -30,6 +32,7 @@ export function getRocketStateAtTime(
       velocity: [st.velocity[0], st.velocity[1], st.velocity[2]],
       speed: st.speed || 0,
       altitude: st.altitude || 0,
+      mass: st.mass || 0,
       fuel_mass: st.fuel_mass || 0,
       thrust_active: st.thrust_active || false,
     };
@@ -43,6 +46,7 @@ export function getRocketStateAtTime(
       velocity: [lastSt.velocity[0], lastSt.velocity[1], lastSt.velocity[2]],
       speed: lastSt.speed || 0,
       altitude: lastSt.altitude || 0,
+      mass: lastSt.mass || 0,
       fuel_mass: lastSt.fuel_mass || 0,
       thrust_active: false,
     };
@@ -70,6 +74,7 @@ export function getRocketStateAtTime(
       velocity: [st.velocity[0], st.velocity[1], st.velocity[2]],
       speed: st.speed || 0,
       altitude: st.altitude || 0,
+      mass: st.mass || 0,
       fuel_mass: st.fuel_mass || 0,
       thrust_active: st.thrust_active || false,
     };
@@ -86,6 +91,7 @@ export function getRocketStateAtTime(
       velocity: [st1.velocity[0], st1.velocity[1], st1.velocity[2]],
       speed: st1.speed || 0,
       altitude: st1.altitude || 0,
+      mass: st1.mass || 0,
       fuel_mass: st1.fuel_mass || 0,
       thrust_active: st1.thrust_active || false,
     };
@@ -107,7 +113,38 @@ export function getRocketStateAtTime(
     velocity: [velX, velY, velZ],
     speed: Math.hypot(velX, velY, velZ),
     altitude: st1.altitude + frac * (st2.altitude - st1.altitude),
+    mass: st1.mass + frac * (st2.mass - st1.mass),
     fuel_mass: st1.fuel_mass + frac * (st2.fuel_mass - st1.fuel_mass),
     thrust_active: frac < 0.5 ? st1.thrust_active : st2.thrust_active,
   };
+}
+
+export type RocketLifecycleState = "FLYING" | "ARRIVED" | "COLLIDED" | "DESTROYED_BY_SUN";
+
+/**
+ * Returns the exact lifecycle state of a rocket at physical simulation time simTimeSec.
+ */
+export function getRocketLifecycleState(
+  rocket: ActiveRocket,
+  simTimeSec: number
+): RocketLifecycleState {
+  if (rocket.collisionState === "DESTROYED_BY_SUN") return "DESTROYED_BY_SUN";
+  if (rocket.collisionState === "COLLIDED") return "COLLIDED";
+
+  const history = rocket.result?.state_history;
+  if (!history || history.length === 0) return "ARRIVED";
+
+  const finalT = history[history.length - 1].time_seconds;
+  if (simTimeSec >= finalT) return "ARRIVED";
+
+  return "FLYING";
+}
+
+/**
+ * Single Authoritative Fleet Lifecycle Rule:
+ * Returns true if AT LEAST ONE rocket in activeRockets is currently FLYING at simTimeSec.
+ */
+export function hasFlyingRockets(activeRockets: ActiveRocket[], simTimeSec: number): boolean {
+  if (!activeRockets || activeRockets.length === 0) return false;
+  return activeRockets.some((r) => getRocketLifecycleState(r, simTimeSec) === "FLYING");
 }

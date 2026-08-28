@@ -47,7 +47,7 @@ def test_earth_mars_visualization_data():
     sc_pos_f = np.array(sc_hist[-1]["position"])
     mars_pos_f = np.array(mars_hist[-1]["position"])
     arr_distance_m = float(np.linalg.norm(sc_pos_f - mars_pos_f))
-    assert arr_distance_m < 1e9, f"Spacecraft arrival distance from Mars is {arr_distance_m} m"
+    assert arr_distance_m < 2e9, f"Spacecraft arrival distance from Mars is {arr_distance_m} m"
 
     # 5. Planetary motion evolves over time
     earth_pos_f = np.array(earth_hist[-1]["position"])

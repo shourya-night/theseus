@@ -419,9 +419,96 @@ def test_risk_classification():
 # ===========================================================================
 
 def test_full_uncertainty_conjunction_orchestration():
-    """Run full end-to-end analysis and verify the 14-step calculation trace."""
+    """
+    Run full end-to-end analysis and verify the 14-step calculation trace.
+
+    Object B is inclined 5 deg relative to A, so the pair has a genuine node
+    crossing roughly half an orbit into the window.  (The earlier version of
+    this test used two co-planar orbits whose separation never reached a
+    minimum; it produced no TCA at all and passed only because the
+    orchestrator silently evaluated the window midpoint instead.)
+    """
     r_a = 6778.137e3
     r_b = 6778.137e3 + 10.0  # 10m altitude separation
+    mu = 3.986004418e14
+    v_a = math.sqrt(mu / r_a)
+    v_b = math.sqrt(mu / r_b)
+    inc_b = math.radians(5.0)
+
+    def pos_a(t):
+        th = (v_a / r_a) * t
+        return np.array([r_a * math.cos(th), r_a * math.sin(th), 0.0])
+
+    def vel_a(t):
+        th = (v_a / r_a) * t
+        return np.array([-v_a * math.sin(th), v_a * math.cos(th), 0.0])
+
+    def pos_b(t):
+        th = (v_b / r_b) * t + 1e-4
+        return np.array([
+            r_b * math.cos(th),
+            r_b * math.sin(th) * math.cos(inc_b),
+            r_b * math.sin(th) * math.sin(inc_b),
+        ])
+
+    def vel_b(t):
+        th = (v_b / r_b) * t + 1e-4
+        return np.array([
+            -v_b * math.sin(th),
+            v_b * math.cos(th) * math.cos(inc_b),
+            v_b * math.cos(th) * math.sin(inc_b),
+        ])
+
+    cov_a = StateCovariance.from_isotropic(100.0, 0.05, name="Sat A")
+    cov_b = StateCovariance.from_isotropic(100.0, 0.05, name="Sat B")
+
+    res = run_uncertainty_conjunction_analysis(
+        pos_fn_a=pos_a,
+        vel_fn_a=vel_a,
+        pos_fn_b=pos_b,
+        vel_fn_b=vel_b,
+        initial_cov_a=cov_a,
+        initial_cov_b=cov_b,
+        t_start=0.0,
+        t_end=3600.0,
+        hbr_m=10.0,
+    )
+
+    # The pipeline must have actually run, not fallen back to a substitute point.
+    assert res.conjunction_found is True
+    assert res.analysis_status == "COMPLETE"
+
+    assert res.collision_probability is not None
+    assert 0.0 <= res.collision_probability.probability <= 1.0
+    assert len(res.calculation_steps) == 14
+    assert res.calculation_steps[0]["stepIndex"] == 1
+    assert res.calculation_steps[13]["stepIndex"] == 14
+    assert "RISK LEVEL" in res.calculation_steps[13]["result"]
+
+    # The reported geometry must be the TCA geometry.
+    assert res.tca_s is not None and not isinstance(res.tca_s, bool)
+    sep_at_tca = float(np.linalg.norm(pos_a(res.tca_s) - pos_b(res.tca_s)))
+    assert res.miss_distance_m == pytest.approx(sep_at_tca, rel=1e-9, abs=1e-6)
+
+    # Verify JSON serialization
+    d = res.to_dict()
+    assert "conjunction_summary" in d
+    assert "collision_probability" in d
+    assert "risk_assessment" in d
+    assert "calculation_steps" in d
+    assert d["analysis_status"] == "COMPLETE"
+    assert isinstance(d["conjunction_summary"]["tca_s"], float)
+    assert not isinstance(d["conjunction_summary"]["tca_s"], bool)
+
+
+def test_orchestration_refuses_to_classify_risk_without_a_tca():
+    """
+    Two co-planar orbits at slightly different radii drift past each other
+    without ever reaching a closest approach inside the window.  The analysis
+    must halt as indeterminate instead of manufacturing a Pc and a risk level.
+    """
+    r_a = 6778.137e3
+    r_b = 6778.137e3 + 10.0
     mu = 3.986004418e14
     v_a = math.sqrt(mu / r_a)
     v_b = math.sqrt(mu / r_b)
@@ -442,31 +529,31 @@ def test_full_uncertainty_conjunction_orchestration():
         th = (v_b / r_b) * t + 1e-4
         return np.array([-v_b * math.sin(th), v_b * math.cos(th), 0.0])
 
-    cov_a = StateCovariance.from_isotropic(100.0, 0.05, name="Sat A")
-    cov_b = StateCovariance.from_isotropic(100.0, 0.05, name="Sat B")
-
     res = run_uncertainty_conjunction_analysis(
         pos_fn_a=pos_a,
         vel_fn_a=vel_a,
         pos_fn_b=pos_b,
         vel_fn_b=vel_b,
-        initial_cov_a=cov_a,
-        initial_cov_b=cov_b,
+        initial_cov_a=StateCovariance.from_isotropic(100.0, 0.05, name="Sat A"),
+        initial_cov_b=StateCovariance.from_isotropic(100.0, 0.05, name="Sat B"),
         t_start=0.0,
         t_end=300.0,
         hbr_m=10.0,
     )
 
-    assert res.collision_probability is not None
-    assert 0.0 <= res.collision_probability.probability <= 1.0
-    assert len(res.calculation_steps) == 14
-    assert res.calculation_steps[0]["stepIndex"] == 1
-    assert res.calculation_steps[13]["stepIndex"] == 14
-    assert "RISK LEVEL" in res.calculation_steps[13]["result"]
+    assert res.conjunction_found is False
+    assert res.analysis_status == "INDETERMINATE_NO_CONJUNCTION"
+    assert res.collision_probability is None
+    assert res.tca_s is None
+    assert res.miss_distance_m is None
+    assert res.risk_assessment.level == RiskLevel.INDETERMINATE
+    assert res.risk_assessment.action_required is False
+    assert res.risk_assessment.probability is None
 
-    # Verify JSON serialization
-    d = res.to_dict()
-    assert "conjunction_summary" in d
-    assert "collision_probability" in d
-    assert "risk_assessment" in d
-    assert "calculation_steps" in d
+
+def test_classify_risk_refuses_a_missing_probability():
+    """classify_risk must never invent a level from a Pc that was not computed."""
+    with pytest.raises(ValueError):
+        classify_risk(None)
+    with pytest.raises(ValueError):
+        classify_risk(float("nan"))
